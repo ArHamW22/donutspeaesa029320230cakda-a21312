@@ -8,7 +8,6 @@ const server  = http.createServer(app);
 const wss     = new WebSocket.Server({ server });
 app.use(express.json({ limit: '10kb' }));
 
-// ── SECRETS — set these in Render environment variables, never hardcode ──
 const API_KEY = process.env.API_KEY;
 const LRM_KEY = process.env.LRM_KEY;
 const LRM_PID = process.env.LRM_PID;
@@ -20,7 +19,6 @@ if (!API_KEY || !LRM_KEY || !LRM_PID) {
 
 app.get('/', (_req, res) => res.send('online'));
 
-// ── TOKEN STORE — tokens expire after 60 seconds, one-time use ──
 const tokens = new Map();
 
 function generateToken(userKey) {
@@ -35,35 +33,45 @@ function consumeToken(token) {
   const entry = tokens.get(token);
   if (!entry) return null;
   if (Date.now() > entry.expires) { tokens.delete(token); return null; }
-  tokens.delete(token); // one-time use — consumed immediately
+  tokens.delete(token);
   return entry.userKey;
 }
 
-// ── LUARMOR KEY CHECK ──
 async function isKeyValid(key) {
   try {
-    const r = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${key}`, {
+    const url = `https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${key}`;
+    console.log("[DEBUG] Checking key:", key);
+    console.log("[DEBUG] LRM_PID:", LRM_PID);
+    console.log("[DEBUG] LRM_KEY starts with:", LRM_KEY?.slice(0, 20));
+    const r = await fetch(url, {
       headers: { Authorization: LRM_KEY }
     });
+    console.log("[DEBUG] Luarmor HTTP status:", r.status);
     const d = await r.json();
+    console.log("[DEBUG] Luarmor response:", JSON.stringify(d));
     if (!d.success || !d.users?.length) return false;
     const u = d.users[0];
-    if (u.banned) return false;
-    if (u.auth_expire !== -1 && u.auth_expire < Math.floor(Date.now() / 1000)) return false;
+    if (u.banned) { console.log("[DEBUG] Key is banned"); return false; }
+    if (u.auth_expire !== -1 && u.auth_expire < Math.floor(Date.now() / 1000)) {
+      console.log("[DEBUG] Key is expired"); return false;
+    }
     return true;
-  } catch { return false; }
+  } catch(e) {
+    console.log("[DEBUG] isKeyValid error:", e.message);
+    return false;
+  }
 }
 
-// ── /get_token — script calls this first with user_key, gets back a one-time token ──
 app.get('/get_token', async (req, res) => {
   const userKey = req.query.user_key;
   if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
-  if (!await isKeyValid(userKey)) return res.status(403).json({ error: 'Invalid or expired key' });
+  const valid = await isKeyValid(userKey);
+  console.log("[DEBUG] /get_token isKeyValid result:", valid);
+  if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
   const token = generateToken(userKey);
   res.json({ token });
 });
 
-// ── BROADCAST ──
 function broadcast(obj) {
   const buf = Buffer.from(JSON.stringify(obj));
   for (const client of wss.clients) {
@@ -74,7 +82,6 @@ function broadcast(obj) {
 const jobPresence = {};
 const clientKeys  = new Map();
 
-// ── CHECK KEYS EVERY 5s ──
 setInterval(async () => {
   for (const [ws, key] of clientKeys.entries()) {
     if (ws.readyState !== WebSocket.OPEN) { clientKeys.delete(ws); continue; }
@@ -86,7 +93,6 @@ setInterval(async () => {
   }
 }, 5000);
 
-// ── WEBSOCKET — now uses one-time token instead of master key ──
 wss.on('connection', async (ws, req) => {
   const rawUrl = req.url || '/';
   const qIndex = rawUrl.indexOf('?');
@@ -142,7 +148,6 @@ wss.on('connection', async (ws, req) => {
   });
 });
 
-// ── /submit — scanner posts finds here ──
 app.post('/submit', (req, res) => {
   if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   const b = req.body;
@@ -159,7 +164,6 @@ app.post('/submit', (req, res) => {
   res.json({ ok: true });
 });
 
-// ── PING LOOP ──
 setInterval(() => {
   const buf = Buffer.from(JSON.stringify({ type: 'ping' }));
   for (const client of wss.clients) {
