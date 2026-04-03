@@ -48,12 +48,13 @@ function consumeToken(token) {
   return entry.userKey;
 }
 
-// ─── KEY VALIDATION + CACHE ──────────────────────
-const keyCache = new Map();
+// ─── KEY VALIDATION — no cache for valid keys ────
+const invalidCache = new Map();
 
 async function isKeyValid(key) {
-  const cached = keyCache.get(key);
-  if (cached && Date.now() < cached.expires) return cached.valid;
+  // Only cache invalid keys for 10s to avoid hammering Luarmor on bad keys
+  const cached = invalidCache.get(key);
+  if (cached && Date.now() < cached) return false;
 
   try {
     const url = `https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(key)}`;
@@ -64,30 +65,24 @@ async function isKeyValid(key) {
       }
     });
     if (!r.ok) {
-      const text = await r.text();
-      console.log("[DEBUG] Luarmor error:", r.status, text.slice(0, 100));
-      keyCache.set(key, { valid: false, expires: Date.now() + 30_000 });
+      invalidCache.set(key, Date.now() + 10_000);
       return false;
     }
     const d = await r.json();
     if (!d.success || !d.users?.length) {
-      keyCache.set(key, { valid: false, expires: Date.now() + 30_000 });
+      invalidCache.set(key, Date.now() + 10_000);
       return false;
     }
     const u = d.users[0];
     if (u.banned) {
-      keyCache.set(key, { valid: false, expires: Date.now() + 30_000 });
+      invalidCache.set(key, Date.now() + 10_000);
       return false;
     }
     if (u.auth_expire !== -1 && u.auth_expire < Math.floor(Date.now() / 1000)) {
-      keyCache.set(key, { valid: false, expires: Date.now() + 30_000 });
+      invalidCache.set(key, Date.now() + 10_000);
       return false;
     }
-    // Cache until exact expiry time — never a second late
-    const cacheUntil = u.auth_expire === -1
-      ? Date.now() + 86_400_000
-      : u.auth_expire * 1000;
-    keyCache.set(key, { valid: true, expires: cacheUntil });
+    // Valid — no cache, always check live next time
     return true;
   } catch(e) {
     console.log("[DEBUG] isKeyValid error:", e.message);
@@ -132,7 +127,7 @@ function broadcast(obj) {
 const jobPresence = {};
 const clientKeys  = new Map();
 
-// Recheck every 10 seconds — kicks at exactly key expiry
+// Recheck every 10 seconds — no cache so removals detected instantly
 setInterval(async () => {
   for (const [ws, key] of clientKeys.entries()) {
     if (ws.readyState !== WebSocket.OPEN) { clientKeys.delete(ws); continue; }
