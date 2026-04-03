@@ -299,6 +299,7 @@ async function handleMessage(msg) {
     const cmd   = parts[0].toLowerCase();
 
     if (cmd === '!addslot') {
+        console.log('[Debug] addslot parts:', JSON.stringify(parts));
         const mention     = parts[1];
         const durationStr = parts[2];
         if (!mention || !durationStr) {
