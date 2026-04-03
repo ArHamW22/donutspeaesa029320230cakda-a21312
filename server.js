@@ -295,7 +295,7 @@ async function handleMessage(msg) {
     if (msg.author?.bot) return;
     const content = msg.content?.trim();
     if (!content?.startsWith('!')) return;
-    const parts = content.split(' ');
+    const parts = content.split(' ').filter(p => p.length > 0);
     const cmd   = parts[0].toLowerCase();
 
     if (cmd === '!addslot') {
