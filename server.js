@@ -19,6 +19,17 @@ if (!API_KEY || !LRM_KEY || !LRM_PID) {
 
 app.get('/', (_req, res) => res.send('online'));
 
+// TEMP: get server outbound IP for Luarmor whitelist
+app.get('/myip', async (_req, res) => {
+  try {
+    const r = await fetch('https://ifconfig.me/ip');
+    const ip = await r.text();
+    res.send(ip);
+  } catch(e) {
+    res.send('failed: ' + e.message);
+  }
+});
+
 const tokens = new Map();
 
 function generateToken(userKey) {
@@ -39,14 +50,21 @@ function consumeToken(token) {
 
 async function isKeyValid(key) {
   try {
-    const url = `https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${key}`;
+    const url = `https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(key)}`;
     console.log("[DEBUG] Checking key:", key);
     console.log("[DEBUG] LRM_PID:", LRM_PID);
-    console.log("[DEBUG] LRM_KEY starts with:", LRM_KEY?.slice(0, 20));
     const r = await fetch(url, {
-      headers: { Authorization: LRM_KEY }
+      headers: {
+        'Authorization': LRM_KEY.trim(),
+        'Content-Type': 'application/json'
+      }
     });
     console.log("[DEBUG] Luarmor HTTP status:", r.status);
+    if (!r.ok) {
+      const text = await r.text();
+      console.log("[DEBUG] Luarmor error body:", text.slice(0, 200));
+      return false;
+    }
     const d = await r.json();
     console.log("[DEBUG] Luarmor response:", JSON.stringify(d));
     if (!d.success || !d.users?.length) return false;
@@ -82,6 +100,7 @@ function broadcast(obj) {
 const jobPresence = {};
 const clientKeys  = new Map();
 
+// Check keys every 60s instead of 5s to avoid Luarmor rate limits
 setInterval(async () => {
   for (const [ws, key] of clientKeys.entries()) {
     if (ws.readyState !== WebSocket.OPEN) { clientKeys.delete(ws); continue; }
@@ -91,7 +110,7 @@ setInterval(async () => {
       clientKeys.delete(ws);
     }
   }
-}, 5000);
+}, 60_000);
 
 wss.on('connection', async (ws, req) => {
   const rawUrl = req.url || '/';
@@ -123,7 +142,7 @@ wss.on('connection', async (ws, req) => {
       if (jobPresence[_jobId]) {
         for (const existingUser of jobPresence[_jobId]) {
           if (existingUser !== _username) {
-            ws.send(JSON.stringify({ type: 'presence_join', username: existingUser, job_id: _jobId }));
+            try { ws.send(JSON.stringify({ type: 'presence_join', username: existingUser, job_id: _jobId })); } catch(_) {}
           }
         }
       }
@@ -164,12 +183,13 @@ app.post('/submit', (req, res) => {
   res.json({ ok: true });
 });
 
+// Ping clients every 20s to keep connections alive
 setInterval(() => {
   const buf = Buffer.from(JSON.stringify({ type: 'ping' }));
   for (const client of wss.clients) {
     if (client.readyState === WebSocket.OPEN) client.send(buf);
   }
-}, 20000);
+}, 20_000);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log('Cerberus backend running on port', PORT));
