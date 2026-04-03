@@ -19,7 +19,6 @@ if (!API_KEY || !LRM_KEY || !LRM_PID) {
 
 app.get('/', (_req, res) => res.send('online'));
 
-// TEMP: get server outbound IP for Luarmor whitelist
 app.get('/myip', async (_req, res) => {
   try {
     const r = await fetch('https://ifconfig.me/ip');
@@ -30,6 +29,7 @@ app.get('/myip', async (_req, res) => {
   }
 });
 
+// ─── TOKEN SYSTEM ───────────────────────────────
 const tokens = new Map();
 
 function generateToken(userKey) {
@@ -48,31 +48,46 @@ function consumeToken(token) {
   return entry.userKey;
 }
 
+// ─── KEY VALIDATION + CACHE ──────────────────────
+const keyCache = new Map();
+
 async function isKeyValid(key) {
+  const cached = keyCache.get(key);
+  if (cached && Date.now() < cached.expires) return cached.valid;
+
   try {
     const url = `https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(key)}`;
-    console.log("[DEBUG] Checking key:", key);
-    console.log("[DEBUG] LRM_PID:", LRM_PID);
     const r = await fetch(url, {
       headers: {
         'Authorization': LRM_KEY.trim(),
         'Content-Type': 'application/json'
       }
     });
-    console.log("[DEBUG] Luarmor HTTP status:", r.status);
     if (!r.ok) {
       const text = await r.text();
-      console.log("[DEBUG] Luarmor error body:", text.slice(0, 200));
+      console.log("[DEBUG] Luarmor error:", r.status, text.slice(0, 100));
+      keyCache.set(key, { valid: false, expires: Date.now() + 30_000 });
       return false;
     }
     const d = await r.json();
-    console.log("[DEBUG] Luarmor response:", JSON.stringify(d));
-    if (!d.success || !d.users?.length) return false;
-    const u = d.users[0];
-    if (u.banned) { console.log("[DEBUG] Key is banned"); return false; }
-    if (u.auth_expire !== -1 && u.auth_expire < Math.floor(Date.now() / 1000)) {
-      console.log("[DEBUG] Key is expired"); return false;
+    if (!d.success || !d.users?.length) {
+      keyCache.set(key, { valid: false, expires: Date.now() + 30_000 });
+      return false;
     }
+    const u = d.users[0];
+    if (u.banned) {
+      keyCache.set(key, { valid: false, expires: Date.now() + 30_000 });
+      return false;
+    }
+    if (u.auth_expire !== -1 && u.auth_expire < Math.floor(Date.now() / 1000)) {
+      keyCache.set(key, { valid: false, expires: Date.now() + 30_000 });
+      return false;
+    }
+    // Cache until exact expiry time — never a second late
+    const cacheUntil = u.auth_expire === -1
+      ? Date.now() + 86_400_000
+      : u.auth_expire * 1000;
+    keyCache.set(key, { valid: true, expires: cacheUntil });
     return true;
   } catch(e) {
     console.log("[DEBUG] isKeyValid error:", e.message);
@@ -80,16 +95,32 @@ async function isKeyValid(key) {
   }
 }
 
+// ─── ROUTES ─────────────────────────────────────
 app.get('/get_token', async (req, res) => {
   const userKey = req.query.user_key;
   if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
   const valid = await isKeyValid(userKey);
-  console.log("[DEBUG] /get_token isKeyValid result:", valid);
   if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
-  const token = generateToken(userKey);
-  res.json({ token });
+  res.json({ token: generateToken(userKey) });
 });
 
+app.post('/submit', (req, res) => {
+  if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  const b = req.body;
+  if (!b?.name) return res.status(400).json({ error: 'Missing name' });
+  broadcast({
+    type:     'brainrot',
+    name:     b.name,
+    gen:      b.gen      || '?',
+    mutation: b.mutation || 'None',
+    value:    b.value    || 0,
+    job_id:   b.job_id   || '',
+    place_id: b.place_id || ''
+  });
+  res.json({ ok: true });
+});
+
+// ─── BROADCAST ──────────────────────────────────
 function broadcast(obj) {
   const buf = Buffer.from(JSON.stringify(obj));
   for (const client of wss.clients) {
@@ -97,10 +128,11 @@ function broadcast(obj) {
   }
 }
 
+// ─── PRESENCE ───────────────────────────────────
 const jobPresence = {};
 const clientKeys  = new Map();
 
-// Check keys every 60s instead of 5s to avoid Luarmor rate limits
+// Recheck every 10 seconds — kicks at exactly key expiry
 setInterval(async () => {
   for (const [ws, key] of clientKeys.entries()) {
     if (ws.readyState !== WebSocket.OPEN) { clientKeys.delete(ws); continue; }
@@ -110,8 +142,9 @@ setInterval(async () => {
       clientKeys.delete(ws);
     }
   }
-}, 60_000);
+}, 10_000);
 
+// ─── WEBSOCKET ──────────────────────────────────
 wss.on('connection', async (ws, req) => {
   const rawUrl = req.url || '/';
   const qIndex = rawUrl.indexOf('?');
@@ -167,23 +200,7 @@ wss.on('connection', async (ws, req) => {
   });
 });
 
-app.post('/submit', (req, res) => {
-  if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
-  const b = req.body;
-  if (!b?.name) return res.status(400).json({ error: 'Missing name' });
-  broadcast({
-    type:     'brainrot',
-    name:     b.name,
-    gen:      b.gen      || '?',
-    mutation: b.mutation || 'None',
-    value:    b.value    || 0,
-    job_id:   b.job_id   || '',
-    place_id: b.place_id || ''
-  });
-  res.json({ ok: true });
-});
-
-// Ping clients every 20s to keep connections alive
+// ─── PING ───────────────────────────────────────
 setInterval(() => {
   const buf = Buffer.from(JSON.stringify({ type: 'ping' }));
   for (const client of wss.clients) {
