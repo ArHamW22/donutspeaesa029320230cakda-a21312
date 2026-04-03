@@ -334,13 +334,12 @@ async function handleMessage(msg) {
             await discordRequest('POST', `/channels/${dmChannel.id}/messages`, {
                 embeds: [{
                     title:       '🐕 Cerberus Notifier — Your Key',
-                    description: `Your slot is active for **${duration.label}**.\n\nExecute the loader below in your executor to get started.`,
+                    description: `Your slot is active for **${duration.label}**.\n\nHead to the 📡・finder-panel in the Discord server and redeem your key to get started.`,
                     color:       0x00AF41,
                     thumbnail:   { url: LOGO_URL },
                     fields: [
-                        { name: '🔑 Your Key',     value: `\`${key}\``, inline: false },
-                        { name: '⏰ Duration',      value: duration.label, inline: true },
-                        { name: '📜 Loader Script', value: '```\nloadstring(game:HttpGet("https://api.luarmor.net/files/v4/loaders/8b65a6a12c53ed651b9891d38817e1f5.lua"))()\n```', inline: false }
+                        { name: '🔑 Your Key',  value: `\`${key}\``, inline: false },
+                        { name: '⏰ Duration',   value: duration.label, inline: true },
                     ],
                     footer: { text: 'Cerberus Notifier • gg/cerberusnotifier' }
                 }]
