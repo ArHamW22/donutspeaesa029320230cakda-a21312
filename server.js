@@ -277,7 +277,7 @@ async function updatePanel() {
         timestamp:   new Date().toISOString(),
         fields: [{
             name:   full ? '⛔ All slots are full' : `✅ ${MAX_SLOTS - used} slot${MAX_SLOTS - used !== 1 ? 's' : ''} available`,
-            value:  full ? 'Check back later or DM for waitlist' : 'DM to purchase a slot',
+            value:  full ? 'Check back later or create a ticket for waitlist' : 'Create a ticket to purchase a slot',
             inline: false
         }]
     };
