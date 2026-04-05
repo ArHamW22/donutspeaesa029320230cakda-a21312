@@ -50,6 +50,13 @@ const LOGO_URL   = 'https://media.discordapp.net/attachments/1487763701040680971
 
 const ADMIN_IDS = new Set(['1405960794503647324']);
 
+// ─── ENV DEBUG ───────────────────────────────────
+console.log('[ENV CHECK] LRM_KEY:', JSON.stringify(LRM_KEY));
+console.log('[ENV CHECK] LRM_PID:', JSON.stringify(LRM_PID));
+console.log('[ENV CHECK] API_KEY set:', !!API_KEY);
+console.log('[ENV CHECK] BOT_TOKEN set:', !!BOT_TOKEN);
+console.log('[ENV CHECK] CHANNEL_ID:', JSON.stringify(CHANNEL_ID));
+
 if (!API_KEY || !BOT_TOKEN || !CHANNEL_ID) {
     console.error('Missing env vars: API_KEY, BOT_TOKEN, CHANNEL_ID');
     process.exit(1);
@@ -63,10 +70,6 @@ if (!process.env.WEBHOOK_EXECUTIONS) console.warn('[Webhook] WARNING: WEBHOOK_EX
 app.get('/', (_req, res) => res.send('online'));
 
 // ─── LUARMOR HELPERS ─────────────────────────────
-// Only used for slot management (addslot/removeslot/panel).
-// WebSocket auth no longer calls Luarmor API —
-// Luarmor already validated the key before the script ran.
-
 async function getAllUsers() {
     if (!LRM_KEY || !LRM_PID) return [];
     try {
@@ -80,6 +83,7 @@ async function getAllUsers() {
 }
 
 async function createKey(durationSeconds, discordId, label) {
+    console.log('[Luarmor] createKey called — LRM_KEY:', JSON.stringify(LRM_KEY), '| LRM_PID:', JSON.stringify(LRM_PID));
     if (!LRM_KEY || !LRM_PID) return null;
     const auth_expire = Math.floor(Date.now() / 1000) + durationSeconds;
     try {
@@ -91,7 +95,7 @@ async function createKey(durationSeconds, discordId, label) {
         const text = await res.text();
         let d;
         try { d = JSON.parse(text); } catch { console.log('[Luarmor] createKey non-JSON:', text.slice(0, 200)); return null; }
-        if (!d.success) { console.log('[Luarmor] createKey failed:', d); return null; }
+        if (!d.success) { console.log('[Luarmor] createKey failed:', JSON.stringify(d)); return null; }
         return d.user_key;
     } catch(e) { console.log('[Luarmor] createKey error:', e.message); return null; }
 }
@@ -113,9 +117,6 @@ async function getKeyByDiscordId(discordId) {
 }
 
 // ─── TOKEN SYSTEM ────────────────────────────────
-// Short-lived one-time tokens for WebSocket auth.
-// Any non-empty user key gets a token — Luarmor already
-// verified the key before the script executed.
 const tokens = new Map();
 
 function generateToken(userKey) {
@@ -151,10 +152,6 @@ function fireWebhook(webhook, embedData) {
 }
 
 // ─── ROUTES ──────────────────────────────────────
-
-// Issues a one-time WebSocket token.
-// Luarmor already validated the key before script execution,
-// so we just check it's non-empty.
 app.get('/get_token', (req, res) => {
     const userKey = (req.query.user_key || '').trim();
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
@@ -302,12 +299,10 @@ wss.on('connection', async (ws, req) => {
 
     let token = null;
 
-    // 1) Try query string (standard)
     const qIndex = rawUrl.indexOf('?');
     if (qIndex >= 0) {
         try { token = new URLSearchParams(rawUrl.slice(qIndex + 1)).get('token') || null; } catch(_) {}
     }
-    // 2) Fallback: Sec-WebSocket-Protocol header
     if (!token) {
         const proto = req.headers['sec-websocket-protocol'];
         if (proto) token = proto.split(',')[0].trim() || null;
