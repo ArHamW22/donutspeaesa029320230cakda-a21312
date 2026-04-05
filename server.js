@@ -62,6 +62,24 @@ if (!process.env.WEBHOOK_EXECUTIONS) console.warn('[Webhook] WARNING: WEBHOOK_EX
 
 app.get('/', (_req, res) => res.send('online'));
 
+// ─── DEBUG — remove after fixing ────────────────
+app.get('/debug_lrm', async (_req, res) => {
+    const key = LRM_KEY || '';
+    const pid = LRM_PID || '';
+    console.log('[DEBUG] LRM_KEY length:', key.length, '| first10:', key.slice(0,10), '| last4:', key.slice(-4));
+    console.log('[DEBUG] LRM_PID:', pid);
+    try {
+        const url = `https://api.luarmor.net/v3/projects/${pid}/users`;
+        const r = await fetch(url, {
+            headers: { 'Authorization': key, 'Content-Type': 'application/json' }
+        });
+        const body = await r.text();
+        res.json({ status: r.status, key_length: key.length, key_preview: key.slice(0,10)+'...'+key.slice(-4), pid, body: body.slice(0,300) });
+    } catch(e) {
+        res.json({ error: e.message });
+    }
+});
+
 // ─── LUARMOR HELPERS ────────────────────────────
 async function getAllUsers() {
     const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
