@@ -5,18 +5,35 @@ const express      = require('express');
 const http         = require('http');
 const WebSocket    = require('ws');
 const crypto       = require('crypto');
-const { HttpsProxyAgent } = require('https-proxy-agent');
+const axios        = require('axios');
 const app          = express();
 const server       = http.createServer(app);
 const wss          = new WebSocket.Server({ server });
 app.use(express.json({ limit: '10kb' }));
 
-// ─── PROXY (routes Luarmor calls through static IP) ──
-const PROXY_URL    = process.env.PROXY_URL || 'http://jqjrbnvv:l206exue4mcf@31.59.20.176:6754';
-const proxyAgent   = new HttpsProxyAgent(PROXY_URL);
+// ─── PROXY (routes Luarmor calls through static IP via axios) ──
+const PROXY_URL = process.env.PROXY_URL || 'http://jqjrbnvv:l206exue4mcf@31.59.20.176:6754';
+const proxyMatch = PROXY_URL.match(/http:\/\/([^:]+):([^@]+)@([^:]+):(\d+)/)
+const axiosProxy = proxyMatch ? {
+    host:     proxyMatch[3],
+    port:     parseInt(proxyMatch[4]),
+    auth:     { username: proxyMatch[1], password: proxyMatch[2] },
+    protocol: 'http'
+} : undefined;
 
-function luarmorFetch(url, options = {}) {
-    return fetch(url, { ...options, agent: proxyAgent });
+async function luarmorFetch(url, options = {}) {
+    const method  = (options.method || 'GET').toLowerCase();
+    const headers = options.headers || {};
+    const data    = options.body ? JSON.parse(options.body) : undefined;
+    try {
+        const res = await axios({ method, url, headers, data, proxy: axiosProxy });
+        return { ok: true, status: res.status, json: async () => res.data, text: async () => JSON.stringify(res.data) };
+    } catch(e) {
+        const status = e.response?.status || 500;
+        const body   = e.response?.data || e.message;
+        const text   = typeof body === 'string' ? body : JSON.stringify(body);
+        return { ok: false, status, json: async () => body, text: async () => text };
+    }
 }
 
 // ─── RATE LIMITING ───────────────────────────────
