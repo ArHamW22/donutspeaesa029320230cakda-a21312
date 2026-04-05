@@ -130,16 +130,19 @@ async function isKeyValid(key) {
         const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(key)}`, {
             headers: { 'Authorization': LRM_KEY.trim(), 'Content-Type': 'application/json' }
         });
+        const text = await res.text();
+        console.log(`[Luarmor] status=${res.status} body=${text.slice(0, 200)}`);
         if (!res.ok) { invalidCache.set(key, Date.now() + 10_000); return false; }
-        const d = await res.json();
-        if (!d.success || !d.users?.length) { invalidCache.set(key, Date.now() + 10_000); return false; }
-        const u = d.users[0];
+        let d;
+        try { d = JSON.parse(text); } catch { return false; }
+        const u = d.user || (d.users && d.users[0]);
+        if (!d.success || !u) { invalidCache.set(key, Date.now() + 10_000); return false; }
         if (u.banned) { invalidCache.set(key, Date.now() + 10_000); return false; }
-        if (u.auth_expire !== -1 && u.auth_expire < Math.floor(Date.now() / 1000)) {
+        if (u.auth_expire !== -1 && u.auth_expire !== 0 && u.auth_expire < Math.floor(Date.now() / 1000)) {
             invalidCache.set(key, Date.now() + 10_000); return false;
         }
         return true;
-    } catch(e) { return false; }
+    } catch(e) { console.log("[Luarmor] isKeyValid error:", e.message); return false; }
 }
 
 // ─── WEBHOOK HELPER ─────────────────────────────
