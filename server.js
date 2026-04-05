@@ -40,14 +40,18 @@ async function getAllUsers() {
 
 async function createKey(durationSeconds, discordId, label) {
     const auth_expire = Math.floor(Date.now() / 1000) + durationSeconds;
-    const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
-        method: 'POST',
-        headers: { 'Authorization': LRM_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ auth_expire, discord_id: discordId, note: `Cerberus — ${label}` })
-    });
-    const d = await res.json();
-    if (!d.success) { console.log('[Luarmor] createKey failed:', d); return null; }
-    return d.user_key;
+    try {
+        const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
+            method: 'POST',
+            headers: { 'Authorization': LRM_KEY, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ auth_expire, discord_id: discordId, note: `Cerberus — ${label}` })
+        });
+        const text = await res.text();
+        let d;
+        try { d = JSON.parse(text); } catch { console.log('[Luarmor] createKey non-JSON response:', text.slice(0, 200)); return null; }
+        if (!d.success) { console.log('[Luarmor] createKey failed:', d); return null; }
+        return d.user_key;
+    } catch(e) { console.log('[Luarmor] createKey error:', e.message); return null; }
 }
 
 async function revokeKey(userKey) {
@@ -300,7 +304,11 @@ async function handleMessage(msg) {
     if (!content?.startsWith('!')) return;
 
     // ─── ADMIN ONLY ─────────────────────────────
-    if (!ADMIN_IDS.has(msg.author.id)) return;
+    if (!ADMIN_IDS.has(msg.author.id)) {
+        console.log('[Auth] BLOCKED:', msg.author.id, 'tried:', content);
+        return;
+    }
+    console.log('[Auth] ALLOWED:', msg.author.id);
 
     const parts = content.split(' ').filter(p => p.length > 0);
     const cmd   = parts[0].toLowerCase();
