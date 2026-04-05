@@ -10,6 +10,36 @@ const server    = http.createServer(app);
 const wss       = new WebSocket.Server({ server });
 app.use(express.json({ limit: '10kb' }));
 
+// ─── RATE LIMITING ───────────────────────────────
+const jobSubmitTimes  = new Map();
+const globalSubmits   = [];
+const JOB_COOLDOWN_MS = 30_000;
+const GLOBAL_MAX      = 60;
+const GLOBAL_WINDOW   = 3_600_000;
+
+function isRateLimited(jobId) {
+    const now = Date.now();
+    const lastJob = jobSubmitTimes.get(jobId);
+    if (lastJob && now - lastJob < JOB_COOLDOWN_MS) {
+        console.log(`[RateLimit] job_id ${jobId} blocked (cooldown)`);
+        return true;
+    }
+    const cutoff = now - GLOBAL_WINDOW;
+    while (globalSubmits.length > 0 && globalSubmits[0] < cutoff) globalSubmits.shift();
+    if (globalSubmits.length >= GLOBAL_MAX) {
+        console.log(`[RateLimit] Global limit hit (${globalSubmits.length} in last hour)`);
+        return true;
+    }
+    jobSubmitTimes.set(jobId, now);
+    globalSubmits.push(now);
+    if (jobSubmitTimes.size > 1000) {
+        for (const [jid, t] of jobSubmitTimes.entries()) {
+            if (now - t > JOB_COOLDOWN_MS * 2) jobSubmitTimes.delete(jid);
+        }
+    }
+    return false;
+}
+
 const API_KEY    = process.env.API_KEY;
 const LRM_KEY    = process.env.LRM_KEY;
 const LRM_PID    = process.env.LRM_PID;
@@ -25,10 +55,10 @@ if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
     process.exit(1);
 }
 
-// Warn if webhooks are missing but don't exit
-if (!process.env.WEBHOOK_50_400M)   console.warn('[Webhook] WARNING: WEBHOOK_50_400M not set');
-if (!process.env.WEBHOOK_400_999M)  console.warn('[Webhook] WARNING: WEBHOOK_400_999M not set');
-if (!process.env.WEBHOOK_999M_PLUS) console.warn('[Webhook] WARNING: WEBHOOK_999M_PLUS not set');
+if (!process.env.WEBHOOK_50_400M)    console.warn('[Webhook] WARNING: WEBHOOK_50_400M not set');
+if (!process.env.WEBHOOK_400_999M)   console.warn('[Webhook] WARNING: WEBHOOK_400_999M not set');
+if (!process.env.WEBHOOK_999M_PLUS)  console.warn('[Webhook] WARNING: WEBHOOK_999M_PLUS not set');
+if (!process.env.WEBHOOK_EXECUTIONS) console.warn('[Webhook] WARNING: WEBHOOK_EXECUTIONS not set');
 
 app.get('/', (_req, res) => res.send('online'));
 
@@ -52,7 +82,7 @@ async function createKey(durationSeconds, discordId, label) {
         });
         const text = await res.text();
         let d;
-        try { d = JSON.parse(text); } catch { console.log('[Luarmor] createKey non-JSON response:', text.slice(0, 200)); return null; }
+        try { d = JSON.parse(text); } catch { console.log('[Luarmor] createKey non-JSON:', text.slice(0, 200)); return null; }
         if (!d.success) { console.log('[Luarmor] createKey failed:', d); return null; }
         return d.user_key;
     } catch(e) { console.log('[Luarmor] createKey error:', e.message); return null; }
@@ -112,6 +142,22 @@ async function isKeyValid(key) {
     } catch(e) { return false; }
 }
 
+// ─── WEBHOOK HELPER ─────────────────────────────
+function formatVal(v) {
+    if (v >= 1e9) return (v / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
+    if (v >= 1e6) return (v / 1e6).toFixed(1).replace(/\.?0+$/, '') + 'M';
+    if (v >= 1e3) return (v / 1e3).toFixed(1).replace(/\.?0+$/, '') + 'K';
+    return String(v);
+}
+
+function fireWebhook(webhook, embedData) {
+    fetch(webhook, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ embeds: [embedData] })
+    }).catch(e => console.log('[Webhook] Fire failed:', e.message));
+}
+
 // ─── ROUTES ─────────────────────────────────────
 app.get('/get_token', async (req, res) => {
     const userKey = req.query.user_key;
@@ -121,10 +167,98 @@ app.get('/get_token', async (req, res) => {
     res.json({ token: generateToken(userKey) });
 });
 
+// ─── EXECUTION LOGGER ───────────────────────────
+app.post('/log_execute', async (req, res) => {
+    // Validate via Luarmor key (the GUI has script_key, not API_KEY)
+    const keyValid = await isKeyValid(req.headers['x-api-key']);
+    if (!keyValid) return res.status(401).json({ error: 'Unauthorized' });
+    const { username, userId, key } = req.body || {};
+    if (!username) return res.status(400).json({ error: 'Missing username' });
+    console.log(`[Execute] ${username} (${userId}) key=${key}`);
+    const webhook = process.env.WEBHOOK_EXECUTIONS;
+    if (webhook) {
+        fireWebhook(webhook, {
+            title:  '🎮 Cerberus Execution',
+            color:  3066993,
+            fields: [
+                { name: 'Roblox Username', value: String(username),       inline: true  },
+                { name: 'User ID',         value: String(userId || '?'),  inline: true  },
+                { name: 'Key',             value: String(key || 'Unknown'), inline: false },
+            ]
+        });
+    }
+    res.json({ ok: true });
+});
+
+// ─── BATCH SUBMIT (one request → one embed) ─────
+app.post('/submit_batch', async (req, res) => {
+    if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    const b = req.body;
+    if (!b?.pets || !Array.isArray(b.pets) || b.pets.length === 0) {
+        return res.status(400).json({ error: 'Missing pets array' });
+    }
+
+    const jobId = b.job_id || 'unknown';
+    if (isRateLimited(jobId)) return res.status(429).json({ error: 'Rate limited' });
+
+    const pets   = b.pets.sort((a, b) => (b.value || 0) - (a.value || 0));
+    const best   = pets[0];
+    const bestVal = parseFloat(String(best.value || 0));
+    const others  = pets.slice(1);
+
+    for (const pet of pets) {
+        broadcast({
+            type:     'brainrot',
+            name:     pet.name,
+            gen:      pet.gen      || '?',
+            mutation: pet.mutation || 'None',
+            value:    pet.value    || 0,
+            job_id:   b.job_id    || '',
+            place_id: b.place_id  || ''
+        });
+    }
+
+    let webhook = null;
+    if (bestVal >= 999e6)      webhook = process.env.WEBHOOK_999M_PLUS;
+    else if (bestVal >= 400e6) webhook = process.env.WEBHOOK_400_999M;
+    else if (bestVal >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
+
+    console.log(`[Batch] ${pets.length} pets | best=${best.name} val=${bestVal} | webhook=${webhook ? 'SET' : 'NOT SET'}`);
+
+    if (webhook) {
+        const bestMut = best.mutation && best.mutation !== 'None' ? best.mutation : 'Base';
+        const color   = bestVal >= 999e6 ? 0xFFD700 : bestVal >= 400e6 ? 0x00BFFF : 0x00AF41;
+        let desc = `🏆 **Best**\n[${bestMut}] ${best.name} [$${formatVal(bestVal)}/s]`;
+        if (others.length > 0) {
+            desc += '\n\n♦ **Others**';
+            for (const pet of others) {
+                const mut = pet.mutation && pet.mutation !== 'None' ? pet.mutation : 'Base';
+                desc += `\n• [${mut}] ${pet.name} [$${formatVal(pet.value || 0)}/s]`;
+            }
+        }
+        desc += '\n\n💸 **Buy a Slot!**';
+        fireWebhook(webhook, {
+            title:       '⭐ Cerberus Notifier | Finds',
+            description: desc,
+            color,
+            thumbnail:   b.image_url ? { url: b.image_url } : undefined,
+            fields: [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
+            footer:    { text: 'Cerberus Notifier • gg/cerberusnotifier' },
+            timestamp: new Date().toISOString()
+        });
+    }
+
+    res.json({ ok: true });
+});
+
+// ─── LEGACY SINGLE SUBMIT ───────────────────────
 app.post('/submit', async (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const b = req.body;
     if (!b?.name) return res.status(400).json({ error: 'Missing name' });
+
+    const jobId = b.job_id || 'unknown';
+    if (isRateLimited(jobId)) return res.status(429).json({ error: 'Rate limited' });
 
     broadcast({
         type:     'brainrot',
@@ -142,30 +276,18 @@ app.post('/submit', async (req, res) => {
     else if (val >= 400e6) webhook = process.env.WEBHOOK_400_999M;
     else if (val >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
 
-    console.log(`[Webhook] val=${val} | tier=${val >= 999e6 ? '999M+' : val >= 400e6 ? '400-999M' : val >= 50e6 ? '50-400M' : 'below'} | webhook=${webhook ? 'SET' : 'NOT SET'}`);
-
     if (webhook) {
         const mut   = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
         const color = val >= 999e6 ? 0xFFD700 : val >= 400e6 ? 0x00BFFF : 0x00AF41;
-        fetch(webhook, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                embeds: [{
-                    title:       '⭐ Cerberus Notifier | Find',
-                    description: `🏆 **Best**\n[${mut}] ${b.name} [${b.gen || '?'}]\n\n💸 **Buy a Slot!**`,
-                    color,
-                    thumbnail:   b.image_url ? { url: b.image_url } : undefined,
-                    fields: [{
-                        name:   'Players',
-                        value:  b.players ? `${b.players}/8` : 'Unknown',
-                        inline: false
-                    }],
-                    footer:    { text: 'Cerberus Notifier • gg/cerberusnotifier' },
-                    timestamp: new Date().toISOString()
-                }]
-            })
-        }).catch(e => console.log('[Webhook] Fire failed:', e.message));
+        fireWebhook(webhook, {
+            title:       '⭐ Cerberus Notifier | Find',
+            description: `🏆 **Best**\n[${mut}] ${b.name} [$${formatVal(val)}/s]\n\n💸 **Buy a Slot!**`,
+            color,
+            thumbnail:   b.image_url ? { url: b.image_url } : undefined,
+            fields: [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
+            footer:    { text: 'Cerberus Notifier • gg/cerberusnotifier' },
+            timestamp: new Date().toISOString()
+        });
     }
 
     res.json({ ok: true });
@@ -328,24 +450,15 @@ async function updatePanel() {
     };
 
     if (!panelMessageId) {
-        // No message yet, post fresh
         const msg = await discordRequest('POST', `/channels/${CHANNEL_ID}/messages`, { embeds: [embed] });
-        if (msg) {
-            panelMessageId = msg.id;
-            console.log('[Panel] Posted:', panelMessageId);
-        }
+        if (msg) { panelMessageId = msg.id; console.log('[Panel] Posted:', panelMessageId); }
     } else {
-        // Try to update existing message
         const result = await discordRequest('PATCH', `/channels/${CHANNEL_ID}/messages/${panelMessageId}`, { embeds: [embed] });
         if (!result) {
-            // Message was deleted or missing — post a new one
             console.log('[Panel] Message gone, posting new one...');
             panelMessageId = null;
             const msg = await discordRequest('POST', `/channels/${CHANNEL_ID}/messages`, { embeds: [embed] });
-            if (msg) {
-                panelMessageId = msg.id;
-                console.log('[Panel] Re-posted:', panelMessageId);
-            }
+            if (msg) { panelMessageId = msg.id; console.log('[Panel] Re-posted:', panelMessageId); }
         } else {
             console.log('[Panel] Updated at', new Date().toLocaleTimeString());
         }
@@ -404,8 +517,8 @@ async function handleMessage(msg) {
                     color:       0x00AF41,
                     thumbnail:   { url: LOGO_URL },
                     fields: [
-                        { name: '🔑 Your Key',  value: `\`${key}\``, inline: false },
-                        { name: '⏰ Duration',   value: duration.label, inline: true },
+                        { name: '🔑 Your Key', value: `\`${key}\``, inline: false },
+                        { name: '⏰ Duration',  value: duration.label, inline: true },
                     ],
                     footer: { text: 'Cerberus Notifier • gg/cerberusnotifier' }
                 }]
