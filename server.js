@@ -18,6 +18,9 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 const MAX_SLOTS  = 7;
 const LOGO_URL   = 'https://media.discordapp.net/attachments/1487763701040680971/1489669239202644089/image.png';
 
+// ─── ADMIN ALLOWLIST ────────────────────────────
+const ADMIN_IDS = new Set(['1405960794503647324']);
+
 if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
     console.error('Missing env vars: API_KEY, LRM_KEY, LRM_PID, BOT_TOKEN, CHANNEL_ID');
     process.exit(1);
@@ -295,6 +298,10 @@ async function handleMessage(msg) {
     if (msg.author?.bot) return;
     const content = msg.content?.trim();
     if (!content?.startsWith('!')) return;
+
+    // ─── ADMIN ONLY ─────────────────────────────
+    if (!ADMIN_IDS.has(msg.author.id)) return;
+
     const parts = content.split(' ').filter(p => p.length > 0);
     const cmd   = parts[0].toLowerCase();
 
