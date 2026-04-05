@@ -50,8 +50,8 @@ const LOGO_URL   = 'https://media.discordapp.net/attachments/1487763701040680971
 
 const ADMIN_IDS = new Set(['1405960794503647324']);
 
-if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
-    console.error('Missing env vars: API_KEY, LRM_KEY, LRM_PID, BOT_TOKEN, CHANNEL_ID');
+if (!API_KEY || !BOT_TOKEN || !CHANNEL_ID) {
+    console.error('Missing env vars: API_KEY, BOT_TOKEN, CHANNEL_ID');
     process.exit(1);
 }
 
@@ -62,35 +62,25 @@ if (!process.env.WEBHOOK_EXECUTIONS) console.warn('[Webhook] WARNING: WEBHOOK_EX
 
 app.get('/', (_req, res) => res.send('online'));
 
-// ─── DEBUG — remove after fixing ────────────────
-app.get('/debug_lrm', async (_req, res) => {
-    const key = LRM_KEY || '';
-    const pid = LRM_PID || '';
-    console.log('[DEBUG] LRM_KEY length:', key.length, '| first10:', key.slice(0,10), '| last4:', key.slice(-4));
-    console.log('[DEBUG] LRM_PID:', pid);
-    try {
-        const url = `https://api.luarmor.net/v3/projects/${pid}/users`;
-        const r = await fetch(url, {
-            headers: { 'Authorization': key, 'Content-Type': 'application/json' }
-        });
-        const body = await r.text();
-        res.json({ status: r.status, key_length: key.length, key_preview: key.slice(0,10)+'...'+key.slice(-4), pid, body: body.slice(0,300) });
-    } catch(e) {
-        res.json({ error: e.message });
-    }
-});
+// ─── LUARMOR HELPERS ─────────────────────────────
+// Only used for slot management (addslot/removeslot/panel).
+// WebSocket auth no longer calls Luarmor API —
+// Luarmor already validated the key before the script ran.
 
-// ─── LUARMOR HELPERS ────────────────────────────
 async function getAllUsers() {
-    const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
-        headers: { 'Authorization': LRM_KEY, 'Content-Type': 'application/json' }
-    });
-    if (!res.ok) return [];
-    const d = await res.json();
-    return d.users || [];
+    if (!LRM_KEY || !LRM_PID) return [];
+    try {
+        const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
+            headers: { 'Authorization': LRM_KEY, 'Content-Type': 'application/json' }
+        });
+        if (!res.ok) return [];
+        const d = await res.json();
+        return d.users || [];
+    } catch(e) { console.log('[Luarmor] getAllUsers error:', e.message); return []; }
 }
 
 async function createKey(durationSeconds, discordId, label) {
+    if (!LRM_KEY || !LRM_PID) return null;
     const auth_expire = Math.floor(Date.now() / 1000) + durationSeconds;
     try {
         const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
@@ -107,11 +97,14 @@ async function createKey(durationSeconds, discordId, label) {
 }
 
 async function revokeKey(userKey) {
-    const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(userKey)}`, {
-        method: 'DELETE',
-        headers: { 'Authorization': LRM_KEY, 'Content-Type': 'application/json' }
-    });
-    return res.ok;
+    if (!LRM_KEY || !LRM_PID) return false;
+    try {
+        const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(userKey)}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': LRM_KEY, 'Content-Type': 'application/json' }
+        });
+        return res.ok;
+    } catch(e) { console.log('[Luarmor] revokeKey error:', e.message); return false; }
 }
 
 async function getKeyByDiscordId(discordId) {
@@ -119,7 +112,10 @@ async function getKeyByDiscordId(discordId) {
     return users.find(u => u.discord_id === discordId) || null;
 }
 
-// ─── TOKEN SYSTEM ───────────────────────────────
+// ─── TOKEN SYSTEM ────────────────────────────────
+// Short-lived one-time tokens for WebSocket auth.
+// Any non-empty user key gets a token — Luarmor already
+// verified the key before the script executed.
 const tokens = new Map();
 
 function generateToken(userKey) {
@@ -138,32 +134,7 @@ function consumeToken(token) {
     return entry.userKey;
 }
 
-// ─── KEY VALIDATION ─────────────────────────────
-const invalidCache = new Map();
-
-async function isKeyValid(key) {
-    const cached = invalidCache.get(key);
-    if (cached && Date.now() < cached) return false;
-    try {
-        const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(key)}`, {
-            headers: { 'Authorization': LRM_KEY.trim(), 'Content-Type': 'application/json' }
-        });
-        const text = await res.text();
-        console.log(`[Luarmor] status=${res.status} body=${text.slice(0, 200)}`);
-        if (!res.ok) { invalidCache.set(key, Date.now() + 10_000); return false; }
-        let d;
-        try { d = JSON.parse(text); } catch { return false; }
-        const u = d.user || (d.users && d.users[0]);
-        if (!d.success || !u) { invalidCache.set(key, Date.now() + 10_000); return false; }
-        if (u.banned) { invalidCache.set(key, Date.now() + 10_000); return false; }
-        if (u.auth_expire !== -1 && u.auth_expire !== 0 && u.auth_expire < Math.floor(Date.now() / 1000)) {
-            invalidCache.set(key, Date.now() + 10_000); return false;
-        }
-        return true;
-    } catch(e) { console.log("[Luarmor] isKeyValid error:", e.message); return false; }
-}
-
-// ─── WEBHOOK HELPER ─────────────────────────────
+// ─── WEBHOOK HELPER ──────────────────────────────
 function formatVal(v) {
     if (v >= 1e9) return (v / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
     if (v >= 1e6) return (v / 1e6).toFixed(1).replace(/\.?0+$/, '') + 'M';
@@ -179,50 +150,52 @@ function fireWebhook(webhook, embedData) {
     }).catch(e => console.log('[Webhook] Fire failed:', e.message));
 }
 
-// ─── ROUTES ─────────────────────────────────────
-app.get('/get_token', async (req, res) => {
-    const userKey = req.query.user_key;
+// ─── ROUTES ──────────────────────────────────────
+
+// Issues a one-time WebSocket token.
+// Luarmor already validated the key before script execution,
+// so we just check it's non-empty.
+app.get('/get_token', (req, res) => {
+    const userKey = (req.query.user_key || '').trim();
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
-    const valid = await isKeyValid(userKey);
-    if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
+    console.log('[Token] Issued for key:', userKey.slice(0, 8) + '...');
     res.json({ token: generateToken(userKey) });
 });
 
-// ─── EXECUTION LOGGER ───────────────────────────
-app.post('/log_execute', async (req, res) => {
-    const keyValid = await isKeyValid(req.headers['x-api-key']);
-    if (!keyValid) return res.status(401).json({ error: 'Unauthorized' });
-    const { username, userId, key } = req.body || {};
+// ─── EXECUTION LOGGER ────────────────────────────
+app.post('/log_execute', (req, res) => {
+    const key = (req.headers['x-api-key'] || '').trim();
+    if (!key) return res.status(401).json({ error: 'Unauthorized' });
+    const { username, userId } = req.body || {};
     if (!username) return res.status(400).json({ error: 'Missing username' });
-    console.log(`[Execute] ${username} (${userId}) key=${key}`);
+    console.log(`[Execute] ${username} (${userId}) key=${key.slice(0,8)}...`);
     const webhook = process.env.WEBHOOK_EXECUTIONS;
     if (webhook) {
         fireWebhook(webhook, {
             title:  '🎮 Cerberus Execution',
             color:  3066993,
             fields: [
-                { name: 'Roblox Username', value: String(username),       inline: true  },
-                { name: 'User ID',         value: String(userId || '?'),  inline: true  },
-                { name: 'Key',             value: String(key || 'Unknown'), inline: false },
+                { name: 'Roblox Username', value: String(username),      inline: true  },
+                { name: 'User ID',         value: String(userId || '?'), inline: true  },
+                { name: 'Key',             value: key.slice(0,8) + '...', inline: false },
             ]
         });
     }
     res.json({ ok: true });
 });
 
-// ─── BATCH SUBMIT ────────────────────────────────
-app.post('/submit_batch', async (req, res) => {
+// ─── BATCH SUBMIT ─────────────────────────────────
+app.post('/submit_batch', (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const b = req.body;
-    if (!b?.pets || !Array.isArray(b.pets) || b.pets.length === 0) {
+    if (!b?.pets || !Array.isArray(b.pets) || b.pets.length === 0)
         return res.status(400).json({ error: 'Missing pets array' });
-    }
 
     const jobId = b.job_id || 'unknown';
     if (isRateLimited(jobId)) return res.status(429).json({ error: 'Rate limited' });
 
-    const pets   = b.pets.sort((a, b) => (b.value || 0) - (a.value || 0));
-    const best   = pets[0];
+    const pets    = b.pets.sort((a, b) => (b.value || 0) - (a.value || 0));
+    const best    = pets[0];
     const bestVal = parseFloat(String(best.value || 0));
     const others  = pets.slice(1);
 
@@ -267,12 +240,11 @@ app.post('/submit_batch', async (req, res) => {
             timestamp: new Date().toISOString()
         });
     }
-
     res.json({ ok: true });
 });
 
-// ─── LEGACY SINGLE SUBMIT ───────────────────────
-app.post('/submit', async (req, res) => {
+// ─── LEGACY SINGLE SUBMIT ────────────────────────
+app.post('/submit', (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const b = req.body;
     if (!b?.name) return res.status(400).json({ error: 'Missing name' });
@@ -309,11 +281,10 @@ app.post('/submit', async (req, res) => {
             timestamp: new Date().toISOString()
         });
     }
-
     res.json({ ok: true });
 });
 
-// ─── BROADCAST ──────────────────────────────────
+// ─── BROADCAST ───────────────────────────────────
 function broadcast(obj) {
     const buf = Buffer.from(JSON.stringify(obj));
     for (const client of wss.clients) {
@@ -321,41 +292,22 @@ function broadcast(obj) {
     }
 }
 
-// ─── PRESENCE ───────────────────────────────────
+// ─── PRESENCE ────────────────────────────────────
 const jobPresence = {};
-const clientKeys  = new Map();
 
-setInterval(async () => {
-    for (const [ws, key] of clientKeys.entries()) {
-        if (ws.readyState !== WebSocket.OPEN) { clientKeys.delete(ws); continue; }
-        if (!await isKeyValid(key)) {
-            try { ws.send(JSON.stringify({ type: 'expired' })); } catch(_) {}
-            ws.close(4001, 'Key expired');
-            clientKeys.delete(ws);
-        }
-    }
-}, 10_000);
-
-// ─── WEBSOCKET ──────────────────────────────────
+// ─── WEBSOCKET ───────────────────────────────────
 wss.on('connection', async (ws, req) => {
-    // ── TOKEN EXTRACTION (Render-proxy safe) ──────────────────────────────
-    // Render's proxy preserves req.url for WebSocket upgrades, but as a
-    // fallback we also accept the token via Sec-WebSocket-Protocol so the
-    // connection works on any executor / proxy combination.
     const rawUrl = req.url || '/';
     console.log('[WS] req.url =', rawUrl);
 
     let token = null;
 
-    // 1) Try query string (standard path)
+    // 1) Try query string (standard)
     const qIndex = rawUrl.indexOf('?');
     if (qIndex >= 0) {
-        try {
-            token = new URLSearchParams(rawUrl.slice(qIndex + 1)).get('token') || null;
-        } catch(_) {}
+        try { token = new URLSearchParams(rawUrl.slice(qIndex + 1)).get('token') || null; } catch(_) {}
     }
-
-    // 2) Fallback: Sec-WebSocket-Protocol header (sent by Lua client as 2nd arg)
+    // 2) Fallback: Sec-WebSocket-Protocol header
     if (!token) {
         const proto = req.headers['sec-websocket-protocol'];
         if (proto) token = proto.split(',')[0].trim() || null;
@@ -364,16 +316,16 @@ wss.on('connection', async (ws, req) => {
     console.log('[WS] token =', token ? token.slice(0, 12) + '...' : 'NULL');
 
     const userKey = token ? consumeToken(token) : null;
-    console.log('[WS] userKey =', userKey ? 'OK' : 'NULL — closing 4001');
+    console.log('[WS] userKey =', userKey ? userKey.slice(0, 8) + '...' : 'NULL — closing');
 
     if (!userKey) {
         try { ws.send(JSON.stringify({ type: 'expired' })); } catch(_) {}
         ws.close(4001, 'Unauthorized');
         return;
     }
-    // ─────────────────────────────────────────────────────────────────────
 
-    clientKeys.set(ws, userKey);
+    console.log('[WS] Client connected:', userKey.slice(0, 8) + '...');
+
     let _username = null;
     let _jobId    = null;
 
@@ -400,7 +352,6 @@ wss.on('connection', async (ws, req) => {
     });
 
     ws.on('close', () => {
-        clientKeys.delete(ws);
         if (_username && _jobId) {
             if (jobPresence[_jobId]) {
                 jobPresence[_jobId].delete(_username);
@@ -411,7 +362,7 @@ wss.on('connection', async (ws, req) => {
     });
 });
 
-// ─── PING ───────────────────────────────────────
+// ─── PING ────────────────────────────────────────
 setInterval(() => {
     const buf = Buffer.from(JSON.stringify({ type: 'ping' }));
     for (const client of wss.clients) {
