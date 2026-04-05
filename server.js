@@ -25,6 +25,11 @@ if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
     process.exit(1);
 }
 
+// Warn if webhooks are missing but don't exit
+if (!process.env.WEBHOOK_50_400M)   console.warn('[Webhook] WARNING: WEBHOOK_50_400M not set');
+if (!process.env.WEBHOOK_400_999M)  console.warn('[Webhook] WARNING: WEBHOOK_400_999M not set');
+if (!process.env.WEBHOOK_999M_PLUS) console.warn('[Webhook] WARNING: WEBHOOK_999M_PLUS not set');
+
 app.get('/', (_req, res) => res.send('online'));
 
 // ─── LUARMOR HELPERS ────────────────────────────
@@ -137,6 +142,8 @@ app.post('/submit', async (req, res) => {
     else if (val >= 400e6) webhook = process.env.WEBHOOK_400_999M;
     else if (val >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
 
+    console.log(`[Webhook] val=${val} | tier=${val >= 999e6 ? '999M+' : val >= 400e6 ? '400-999M' : val >= 50e6 ? '50-400M' : 'below'} | webhook=${webhook ? 'SET' : 'NOT SET'}`);
+
     if (webhook) {
         const mut   = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
         const color = val >= 999e6 ? 0xFFD700 : val >= 400e6 ? 0x00BFFF : 0x00AF41;
@@ -158,7 +165,7 @@ app.post('/submit', async (req, res) => {
                     timestamp: new Date().toISOString()
                 }]
             })
-        }).catch(() => {});
+        }).catch(e => console.log('[Webhook] Fire failed:', e.message));
     }
 
     res.json({ ok: true });
@@ -321,11 +328,27 @@ async function updatePanel() {
     };
 
     if (!panelMessageId) {
+        // No message yet, post fresh
         const msg = await discordRequest('POST', `/channels/${CHANNEL_ID}/messages`, { embeds: [embed] });
-        if (msg) { panelMessageId = msg.id; console.log('[Panel] Posted:', panelMessageId); }
+        if (msg) {
+            panelMessageId = msg.id;
+            console.log('[Panel] Posted:', panelMessageId);
+        }
     } else {
-        await discordRequest('PATCH', `/channels/${CHANNEL_ID}/messages/${panelMessageId}`, { embeds: [embed] });
-        console.log('[Panel] Updated at', new Date().toLocaleTimeString());
+        // Try to update existing message
+        const result = await discordRequest('PATCH', `/channels/${CHANNEL_ID}/messages/${panelMessageId}`, { embeds: [embed] });
+        if (!result) {
+            // Message was deleted or missing — post a new one
+            console.log('[Panel] Message gone, posting new one...');
+            panelMessageId = null;
+            const msg = await discordRequest('POST', `/channels/${CHANNEL_ID}/messages`, { embeds: [embed] });
+            if (msg) {
+                panelMessageId = msg.id;
+                console.log('[Panel] Re-posted:', panelMessageId);
+            }
+        } else {
+            console.log('[Panel] Updated at', new Date().toLocaleTimeString());
+        }
     }
 }
 
