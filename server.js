@@ -18,7 +18,6 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 const MAX_SLOTS  = 7;
 const LOGO_URL   = 'https://media.discordapp.net/attachments/1487763701040680971/1489669239202644089/image.png';
 
-// ─── ADMIN ALLOWLIST ────────────────────────────
 const ADMIN_IDS = new Set(['1405960794503647324']);
 
 if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
@@ -117,10 +116,11 @@ app.get('/get_token', async (req, res) => {
     res.json({ token: generateToken(userKey) });
 });
 
-app.post('/submit', (req, res) => {
+app.post('/submit', async (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const b = req.body;
     if (!b?.name) return res.status(400).json({ error: 'Missing name' });
+
     broadcast({
         type:     'brainrot',
         name:     b.name,
@@ -130,6 +130,37 @@ app.post('/submit', (req, res) => {
         job_id:   b.job_id   || '',
         place_id: b.place_id || ''
     });
+
+    const val = parseFloat(String(b.value || 0));
+    let webhook = null;
+    if (val >= 999e6)      webhook = process.env.WEBHOOK_999M_PLUS;
+    else if (val >= 400e6) webhook = process.env.WEBHOOK_400_999M;
+    else if (val >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
+
+    if (webhook) {
+        const mut   = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
+        const color = val >= 999e6 ? 0xFFD700 : val >= 400e6 ? 0x00BFFF : 0x00AF41;
+        fetch(webhook, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                embeds: [{
+                    title:       '⭐ Cerberus Notifier | Find',
+                    description: `🏆 **Best**\n[${mut}] ${b.name} [${b.gen || '?'}]\n\n💸 **Buy a Slot!**`,
+                    color,
+                    thumbnail:   b.image_url ? { url: b.image_url } : undefined,
+                    fields: [{
+                        name:   'Players',
+                        value:  b.players ? `${b.players}/8` : 'Unknown',
+                        inline: false
+                    }],
+                    footer:    { text: 'Cerberus Notifier • gg/cerberusnotifier' },
+                    timestamp: new Date().toISOString()
+                }]
+            })
+        }).catch(() => {});
+    }
+
     res.json({ ok: true });
 });
 
@@ -302,24 +333,20 @@ async function handleMessage(msg) {
     if (msg.author?.bot) return;
     const content = msg.content?.trim();
     if (!content?.startsWith('!')) return;
-
-    // ─── ADMIN ONLY ─────────────────────────────
     if (!ADMIN_IDS.has(msg.author.id)) {
         console.log('[Auth] BLOCKED:', msg.author.id, 'tried:', content);
         return;
     }
     console.log('[Auth] ALLOWED:', msg.author.id);
-
     const parts = content.split(' ').filter(p => p.length > 0);
     const cmd   = parts[0].toLowerCase();
 
     if (cmd === '!addslot') {
-        console.log('[Debug] addslot parts:', JSON.stringify(parts));
         const mention     = parts[1];
         const durationStr = parts[2];
         if (!mention || !durationStr) {
             return discordRequest('POST', `/channels/${msg.channel_id}/messages`, {
-                content: '❌ Usage: `!addslot @user <duration>` e.g. `!addslot @user 1d` `!addslot @user 1w` `!addslot @user 1m`'
+                content: '❌ Usage: `!addslot @user <duration>` e.g. `!addslot @user 1d`'
             });
         }
         const duration = parseDuration(durationStr);
