@@ -1,14 +1,23 @@
 // ══════════════════════════════════════════════════
 //  CERBERUS — COMBINED BACKEND + SLOTS BOT
 // ══════════════════════════════════════════════════
-const express   = require('express');
-const http      = require('http');
-const WebSocket = require('ws');
-const crypto    = require('crypto');
-const app       = express();
-const server    = http.createServer(app);
-const wss       = new WebSocket.Server({ server });
+const express      = require('express');
+const http         = require('http');
+const WebSocket    = require('ws');
+const crypto       = require('crypto');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const app          = express();
+const server       = http.createServer(app);
+const wss          = new WebSocket.Server({ server });
 app.use(express.json({ limit: '10kb' }));
+
+// ─── PROXY (routes Luarmor calls through static IP) ──
+const PROXY_URL    = process.env.PROXY_URL || 'http://jqjrbnvv:l206exue4mcf@31.59.20.176:6754';
+const proxyAgent   = new HttpsProxyAgent(PROXY_URL);
+
+function luarmorFetch(url, options = {}) {
+    return fetch(url, { ...options, agent: proxyAgent });
+}
 
 // ─── RATE LIMITING ───────────────────────────────
 const jobSubmitTimes  = new Map();
@@ -73,7 +82,7 @@ app.get('/', (_req, res) => res.send('online'));
 async function getAllUsers() {
     if (!LRM_KEY || !LRM_PID) return [];
     try {
-        const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
+        const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
             headers: { 'Authorization': LRM_KEY, 'Content-Type': 'application/json' }
         });
         if (!res.ok) return [];
@@ -87,7 +96,7 @@ async function createKey(durationSeconds, discordId, label) {
     if (!LRM_KEY || !LRM_PID) return null;
     const auth_expire = Math.floor(Date.now() / 1000) + durationSeconds;
     try {
-        const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
+        const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
             method: 'POST',
             headers: { 'Authorization': LRM_KEY, 'Content-Type': 'application/json' },
             body: JSON.stringify({ auth_expire, discord_id: discordId, note: `Cerberus — ${label}` })
@@ -103,7 +112,7 @@ async function createKey(durationSeconds, discordId, label) {
 async function revokeKey(userKey) {
     if (!LRM_KEY || !LRM_PID) return false;
     try {
-        const res = await fetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(userKey)}`, {
+        const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(userKey)}`, {
             method: 'DELETE',
             headers: { 'Authorization': LRM_KEY, 'Content-Type': 'application/json' }
         });
@@ -324,6 +333,21 @@ wss.on('connection', async (ws, req) => {
     let _username = null;
     let _jobId    = null;
 
+    // Every 60s check if Luarmor key is still active — kick if expired/revoked
+    const expiryCheck = setInterval(async () => {
+        try {
+            const users = await getAllUsers();
+            const user  = users.find(u => u.user_key === userKey);
+            const now   = Math.floor(Date.now() / 1000);
+            const valid = user && !user.banned && (user.auth_expire === -1 || user.auth_expire > now);
+            if (!valid) {
+                console.log('[WS] Key expired/revoked, disconnecting:', userKey.slice(0, 8) + '...');
+                try { ws.send(JSON.stringify({ type: 'expired' })); } catch(_) {}
+                ws.close(4001, 'Key expired');
+            }
+        } catch(e) { console.log('[WS] Expiry check error:', e.message); }
+    }, 10_000);
+
     ws.on('message', data => {
         let msg;
         try { msg = JSON.parse(data); } catch { return; }
@@ -347,6 +371,7 @@ wss.on('connection', async (ws, req) => {
     });
 
     ws.on('close', () => {
+        clearInterval(expiryCheck);
         if (_username && _jobId) {
             if (jobPresence[_jobId]) {
                 jobPresence[_jobId].delete(_username);
