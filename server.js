@@ -172,7 +172,6 @@ app.get('/get_token', async (req, res) => {
 
 // ─── EXECUTION LOGGER ───────────────────────────
 app.post('/log_execute', async (req, res) => {
-    // Validate via Luarmor key (the GUI has script_key, not API_KEY)
     const keyValid = await isKeyValid(req.headers['x-api-key']);
     if (!keyValid) return res.status(401).json({ error: 'Unauthorized' });
     const { username, userId, key } = req.body || {};
@@ -193,7 +192,7 @@ app.post('/log_execute', async (req, res) => {
     res.json({ ok: true });
 });
 
-// ─── BATCH SUBMIT (one request → one embed) ─────
+// ─── BATCH SUBMIT ────────────────────────────────
 app.post('/submit_batch', async (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const b = req.body;
@@ -321,17 +320,40 @@ setInterval(async () => {
 
 // ─── WEBSOCKET ──────────────────────────────────
 wss.on('connection', async (ws, req) => {
+    // ── TOKEN EXTRACTION (Render-proxy safe) ──────────────────────────────
+    // Render's proxy preserves req.url for WebSocket upgrades, but as a
+    // fallback we also accept the token via Sec-WebSocket-Protocol so the
+    // connection works on any executor / proxy combination.
     const rawUrl = req.url || '/';
+    console.log('[WS] req.url =', rawUrl);
+
+    let token = null;
+
+    // 1) Try query string (standard path)
     const qIndex = rawUrl.indexOf('?');
-    const params = qIndex >= 0 ? new URLSearchParams(rawUrl.slice(qIndex + 1)) : new URLSearchParams();
-    const token   = params.get('token');
+    if (qIndex >= 0) {
+        try {
+            token = new URLSearchParams(rawUrl.slice(qIndex + 1)).get('token') || null;
+        } catch(_) {}
+    }
+
+    // 2) Fallback: Sec-WebSocket-Protocol header (sent by Lua client as 2nd arg)
+    if (!token) {
+        const proto = req.headers['sec-websocket-protocol'];
+        if (proto) token = proto.split(',')[0].trim() || null;
+    }
+
+    console.log('[WS] token =', token ? token.slice(0, 12) + '...' : 'NULL');
+
     const userKey = token ? consumeToken(token) : null;
+    console.log('[WS] userKey =', userKey ? 'OK' : 'NULL — closing 4001');
 
     if (!userKey) {
         try { ws.send(JSON.stringify({ type: 'expired' })); } catch(_) {}
         ws.close(4001, 'Unauthorized');
         return;
     }
+    // ─────────────────────────────────────────────────────────────────────
 
     clientKeys.set(ws, userKey);
     let _username = null;
