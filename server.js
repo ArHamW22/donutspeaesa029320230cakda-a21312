@@ -8,6 +8,9 @@
 //  • jobPresence memory leak fixed
 //  • Express 5 aligned in package.json
 //  • Node >=18 enforced via engines field
+//  • FIXED: removed redundant isKeyValid call on WS connect
+//    (token already proves key is valid — double-call was
+//     causing immediate disconnects if Luarmor was slow)
 // ══════════════════════════════════════════════════
 'use strict';
 
@@ -130,7 +133,6 @@ async function isKeyValid(key) {
     }
 }
 
-// Look up a Luarmor user by their key — used to resolve Discord ID at execute time
 async function getUserByKey(userKey) {
     try {
         const res = await luarmorFetch(
@@ -187,12 +189,14 @@ async function getKeyByDiscordId(discordId) {
 }
 
 // ─── TOKEN SYSTEM ────────────────────────────────
-const tokens = new Map(); // token → { userKey, expires }
+// Tokens now store the full user object so WS connect
+// can use it directly without a second Luarmor call.
+const tokens = new Map(); // token → { userKey, user, expires }
 
-function generateToken(userKey) {
+function generateToken(userKey, user) {
     const token   = crypto.randomBytes(32).toString('hex');
     const expires = Date.now() + 60_000;
-    tokens.set(token, { userKey, expires });
+    tokens.set(token, { userKey, user, expires });
     setTimeout(() => tokens.delete(token), 60_000);
     return token;
 }
@@ -203,7 +207,7 @@ function consumeToken(token) {
     if (!entry) return null;
     if (Date.now() > entry.expires) { tokens.delete(token); return null; }
     tokens.delete(token);
-    return entry.userKey;
+    return entry; // returns { userKey, user }
 }
 
 // ─── RATE LIMITING ───────────────────────────────
@@ -247,9 +251,6 @@ function wsKick(ws, reason = 'Key expired') {
 const PING_BUF    = Buffer.from(JSON.stringify({ type: 'ping' }));
 const EXPIRED_BUF = Buffer.from(JSON.stringify({ type: 'expired' }));
 
-// FIX: broadcast now accepts an optional sender to exclude.
-// Presence messages should never echo back to the sender —
-// the Lua client already filters them but it wastes bandwidth.
 function broadcast(obj, excludeWs = null) {
     const buf = Buffer.from(JSON.stringify(obj));
     for (const client of wss.clients) {
@@ -281,21 +282,16 @@ app.get('/get_token', async (req, res) => {
     const userKey = (req.query.user_key || '').trim();
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
 
-    const { valid } = await isKeyValid(userKey);
+    const { valid, user } = await isKeyValid(userKey);
     if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
 
     console.log('[Token] Issued for key:', userKey.slice(0, 8) + '…');
-    res.json({ token: generateToken(userKey) });
+    // FIX: pass user object into token so WS connect doesn't need to re-fetch
+    res.json({ token: generateToken(userKey, user) });
 });
 
-// FIX: /log_execute now:
-//   1. Validates the key is real and active (not just non-empty)
-//   2. Looks up the Discord ID tied to that key via Luarmor
-//   3. Includes Discord mention in the webhook embed
 app.post('/log_execute', async (req, res) => {
     const userKey = (req.headers['x-api-key'] || '').trim();
-
-    // FIX: was only checking if header exists — now validates against Luarmor
     if (!userKey) return res.status(401).json({ error: 'Unauthorized' });
     const { valid, user } = await isKeyValid(userKey);
     if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
@@ -303,8 +299,6 @@ app.post('/log_execute', async (req, res) => {
     const { username, userId } = req.body || {};
     if (!username) return res.status(400).json({ error: 'Missing username' });
 
-    // Resolve Discord identity from the Luarmor user record
-    // (user already fetched above from isKeyValid — no extra API call needed)
     const discordId  = user?.discord_id || null;
     const discordTag = discordId ? `<@${discordId}>` : 'Unknown';
 
@@ -415,9 +409,6 @@ app.post('/submit', (req, res) => {
 // ══════════════════════════════════════════════════
 //  WEBSOCKET
 // ══════════════════════════════════════════════════
-
-// FIX: jobPresence cleanup — track Set size explicitly and prune
-// empty entries immediately to prevent memory accumulation
 const jobPresence = {};
 
 function presenceJoin(jobId, username) {
@@ -428,7 +419,6 @@ function presenceJoin(jobId, username) {
 function presenceLeave(jobId, username) {
     if (!jobPresence[jobId]) return;
     jobPresence[jobId].delete(username);
-    // FIX: prune immediately when empty — no lingering empty Sets
     if (jobPresence[jobId].size === 0) delete jobPresence[jobId];
 }
 
@@ -446,28 +436,30 @@ wss.on('connection', async (ws, req) => {
     }
 
     // ── Auth ──────────────────────────────────────
-    const userKey = consumeToken(token);
-    if (!userKey) {
+    // FIX: consumeToken now returns { userKey, user } so we skip the
+    // second Luarmor API call that was causing immediate disconnects.
+    // The token was already validated against Luarmor at /get_token
+    // (max 60 seconds ago) so re-validating here is redundant and
+    // was the root cause of the "Disconnected" issue.
+    const entry = consumeToken(token);
+    if (!entry) {
         try { ws.send(EXPIRED_BUF); } catch {}
         ws.terminate();
         return;
     }
 
-    const { valid, user } = await isKeyValid(userKey);
-    if (!valid) {
-        try { ws.send(EXPIRED_BUF); } catch {}
-        ws.terminate();
-        return;
-    }
+    const { userKey, user } = entry;
 
     ws._cerberusKey = userKey;
+    ws._authExpire  = user ? user.auth_expire : null; // used by 5s in-memory watcher
     ws.isAlive      = true;
 
     console.log('[WS] Connected:', userKey.slice(0, 8) + '…');
 
     // ── PRECISE EXPIRY KICK ───────────────────────
+    // Still schedule expiry kick using the user object we already have
     let expiryTimer = null;
-    if (user.auth_expire !== -1) {
+    if (user && user.auth_expire !== -1) {
         const secsLeft = user.auth_expire - Math.floor(Date.now() / 1000);
         if (secsLeft > 0) {
             expiryTimer = setTimeout(() => {
@@ -496,7 +488,6 @@ wss.on('connection', async (ws, req) => {
             _username = msg.username;
             _jobId    = msg.job_id;
 
-            // Tell this client who's already in the job
             if (jobPresence[_jobId]) {
                 for (const existing of jobPresence[_jobId]) {
                     if (existing !== _username) {
@@ -506,13 +497,10 @@ wss.on('connection', async (ws, req) => {
             }
 
             presenceJoin(_jobId, _username);
-
-            // FIX: exclude sender — they don't need their own join echoed back
             broadcast({ type: 'presence_join', username: _username, job_id: _jobId }, ws);
             return;
         }
 
-        // All other messages (non-presence) broadcast to everyone including sender
         broadcast(msg);
     });
 
@@ -521,7 +509,6 @@ wss.on('connection', async (ws, req) => {
         if (expiryTimer) clearTimeout(expiryTimer);
         if (_username && _jobId) {
             presenceLeave(_jobId, _username);
-            // FIX: exclude the closing socket (it's already gone)
             broadcast({ type: 'presence_leave', username: _username, job_id: _jobId }, ws);
         }
     });
@@ -539,6 +526,23 @@ const heartbeatInterval = setInterval(() => {
 wss.on('close', () => clearInterval(heartbeatInterval));
 
 // ─── FALLBACK WATCHER ────────────────────────────
+// Two-tier approach:
+//   • Every 5s: cheap in-memory expiry check (no API call) — catches
+//     the exact second auth_expire passes for any connected socket.
+//   • Every 60s: full Luarmor re-fetch — catches bans and any external
+//     key changes made on the Luarmor dashboard.
+setInterval(() => {
+    if (wss.clients.size === 0) return;
+    const now = Math.floor(Date.now() / 1000);
+    for (const ws of wss.clients) {
+        if (ws.readyState !== WebSocket.OPEN) continue;
+        if (ws._authExpire !== -1 && ws._authExpire && ws._authExpire <= now) {
+            console.log('[Watcher] In-memory expiry kick:', ws._cerberusKey?.slice(0, 8) + '…');
+            wsKick(ws);
+        }
+    }
+}, 5_000);
+
 setInterval(async () => {
     if (wss.clients.size === 0) return;
     const now     = Math.floor(Date.now() / 1000);
@@ -550,11 +554,13 @@ setInterval(async () => {
         const u     = userMap.get(ws._cerberusKey);
         const valid = u && !u.banned && (u.auth_expire === -1 || u.auth_expire > now);
         if (!valid) {
-            console.log('[Watcher] Kicking expired/banned key:', ws._cerberusKey?.slice(0, 8) + '…');
+            console.log('[Watcher] Luarmor kick (banned/changed):', ws._cerberusKey?.slice(0, 8) + '…');
             wsKick(ws);
         }
+        // Keep in-memory expiry in sync with Luarmor in case it changed
+        if (u) ws._authExpire = u.auth_expire;
     }
-}, 30_000);
+}, 60_000);
 
 // ─── JSON PING ───────────────────────────────────
 setInterval(() => {
@@ -567,10 +573,6 @@ setInterval(() => {
 
 // ══════════════════════════════════════════════════
 //  STARTUP — RE-SCHEDULE EXPIRY TIMERS
-//  FIX: On restart all in-memory setTimeout calls are lost.
-//  We fetch all active keys and re-arm their expiry timers
-//  so users already holding keys still get kicked on time
-//  even if the server restarted mid-session.
 // ══════════════════════════════════════════════════
 function kickLiveSockets(userKey) {
     for (const client of wss.clients) {
@@ -588,9 +590,9 @@ async function rescheduleExpiryTimers() {
 
     for (const u of users) {
         if (u.banned) continue;
-        if (u.auth_expire === -1) continue; // lifetime key — no timer needed
+        if (u.auth_expire === -1) continue;
         const secsLeft = u.auth_expire - now;
-        if (secsLeft <= 0) continue; // already expired — watcher will handle it
+        if (secsLeft <= 0) continue;
 
         setTimeout(() => {
             console.log('[Expiry] Startup timer fired for key:', u.user_key?.slice(0, 8) + '…');
@@ -713,7 +715,6 @@ async function handleMessage(msg) {
     const parts = content.split(/\s+/).filter(Boolean);
     const cmd   = parts[0].toLowerCase();
 
-    // ── !addslot ──────────────────────────────────
     if (cmd === '!addslot') {
         const mention     = parts[1];
         const durationStr = parts[2];
@@ -749,14 +750,12 @@ async function handleMessage(msg) {
             });
         }
 
-        // Schedule expiry timer — also kicks any live socket at expiry time
         setTimeout(() => {
             console.log('[Expiry] Timer fired for key:', key.slice(0, 8) + '…');
             kickLiveSockets(key);
             schedulePanel(500);
         }, duration.seconds * 1000);
 
-        // DM the user their key
         const dmChannel = await discordRequest('POST', '/users/@me/channels', { recipient_id: discordId });
         if (dmChannel) {
             await discordRequest('POST', `/channels/${dmChannel.id}/messages`, {
@@ -781,7 +780,6 @@ async function handleMessage(msg) {
         return;
     }
 
-    // ── !removeslot ───────────────────────────────
     if (cmd === '!removeslot') {
         const mention = parts[1];
         if (!mention) {
@@ -805,7 +803,6 @@ async function handleMessage(msg) {
         return;
     }
 
-    // ── !slots ────────────────────────────────────
     if (cmd === '!slots') {
         const now    = Math.floor(Date.now() / 1000);
         const users  = await getAllUsers();
@@ -816,7 +813,6 @@ async function handleMessage(msg) {
         return;
     }
 
-    // ── !help ─────────────────────────────────────
     if (cmd === '!help') {
         await discordRequest('POST', `/channels/${msg.channel_id}/messages`, {
             embeds: [{
@@ -860,7 +856,6 @@ function startGateway() {
 
         if (op === 0 && t === 'READY') {
             console.log('[Gateway] Bot ready:', d.user.username);
-            // Re-schedule expiry timers first, then update panel
             await rescheduleExpiryTimers();
             updatePanel();
         }
@@ -881,7 +876,6 @@ function startGateway() {
 
 startGateway();
 
-// Panel refresh every 60s
 setInterval(updatePanel, 60_000);
 
 // ─── START ───────────────────────────────────────
