@@ -3,9 +3,12 @@
   "version": "1.0.0",
   "main": "server.js",
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "axios": "^1.14.0",
-    "express": "^4.22.1",
+    "express": "^5.2.1",
     "ws": "^8.20.0"
   }
 }
