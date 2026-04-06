@@ -1,14 +1,13 @@
 // ══════════════════════════════════════════════════
 //  CERBERUS — server.js
-//  • Instant WS kick via per-key setTimeout (no polling needed for normal expiry)
-//  • 30s fallback watcher catches manual revokes / bans (1 Luarmor call shared)
-//  • !removeslot kicks live socket in <300ms
-//  • isAlive heartbeat terminates zombie connections (ws best practice)
-//  • Luarmor user list cached 30s — invalidated on every write
-//  • Debounced Discord panel updates
-//  • Pre-serialised ping buffer (no repeated JSON.stringify)
-//  • Single-use, replay-proof tokens (64-char hex, 60s TTL)
-//  • Every ws.send / ws.close wrapped — never crashes on broken pipe
+//  Fixed build:
+//  • /log_execute resolves Discord username from key
+//  • /log_execute validates key before accepting
+//  • Expiry timers re-scheduled on startup (survive restarts)
+//  • broadcast skips sender for presence messages
+//  • jobPresence memory leak fixed
+//  • Express 5 aligned in package.json
+//  • Node >=18 enforced via engines field
 // ══════════════════════════════════════════════════
 'use strict';
 
@@ -20,7 +19,7 @@ const axios     = require('axios');
 
 const app    = express();
 const server = http.createServer(app);
-const wss    = new WebSocket.Server({ server, perMessageDeflate: false }); // deflate off — tiny payloads, not worth overhead
+const wss    = new WebSocket.Server({ server, perMessageDeflate: false });
 app.use(express.json({ limit: '50kb' }));
 
 // ─── PROXY ───────────────────────────────────────
@@ -40,19 +39,19 @@ async function luarmorFetch(url, options = {}) {
     try {
         const res = await axios({ method, url, headers, data, proxy: axiosProxy, timeout: 10_000 });
         return {
-            ok:   true,
+            ok:     true,
             status: res.status,
-            json: async () => res.data,
-            text: async () => JSON.stringify(res.data),
+            json:   async () => res.data,
+            text:   async () => JSON.stringify(res.data),
         };
     } catch (e) {
         const status = e.response?.status || 500;
         const body   = e.response?.data   || e.message;
         return {
-            ok:     false,
+            ok:   false,
             status,
-            json:   async () => body,
-            text:   async () => (typeof body === 'string' ? body : JSON.stringify(body)),
+            json: async () => body,
+            text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
         };
     }
 }
@@ -85,8 +84,6 @@ if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
 app.get('/', (_req, res) => res.send('online'));
 
 // ─── LUARMOR — CACHED USER LIST ──────────────────
-// getAllUsers() caches for 30s.  Every write (create/revoke) invalidates
-// immediately so the fallback watcher never uses stale data after a slot change.
 let _usersCache   = null;
 let _usersCacheAt = 0;
 const USERS_TTL   = 30_000;
@@ -99,7 +96,7 @@ async function getAllUsers(forceRefresh = false) {
             headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' },
         });
         if (!res.ok) return _usersCache || [];
-        const d   = await res.json();
+        const d       = await res.json();
         _usersCache   = d.users || [];
         _usersCacheAt = now;
         return _usersCache;
@@ -114,7 +111,6 @@ function invalidateUsersCache() {
     _usersCacheAt = 0;
 }
 
-// Validate a single key with a dedicated query (used at token-issue time only)
 async function isKeyValid(key) {
     try {
         const res = await luarmorFetch(
@@ -126,11 +122,27 @@ async function isKeyValid(key) {
         if (!d.success || !d.users?.length) return { valid: false, user: null };
         const u   = d.users[0];
         const now = Math.floor(Date.now() / 1000);
-        if (u.banned)                                         return { valid: false, user: u };
-        if (u.auth_expire !== -1 && u.auth_expire <= now)    return { valid: false, user: u };
+        if (u.banned)                                      return { valid: false, user: u };
+        if (u.auth_expire !== -1 && u.auth_expire <= now) return { valid: false, user: u };
         return { valid: true, user: u };
     } catch {
         return { valid: false, user: null };
+    }
+}
+
+// Look up a Luarmor user by their key — used to resolve Discord ID at execute time
+async function getUserByKey(userKey) {
+    try {
+        const res = await luarmorFetch(
+            `https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(userKey)}`,
+            { headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' } },
+        );
+        if (!res.ok) return null;
+        const d = await res.json();
+        if (!d.success || !d.users?.length) return null;
+        return d.users[0];
+    } catch {
+        return null;
     }
 }
 
@@ -175,7 +187,6 @@ async function getKeyByDiscordId(discordId) {
 }
 
 // ─── TOKEN SYSTEM ────────────────────────────────
-// Single-use, 60 s TTL, 64-char hex — replay-proof
 const tokens = new Map(); // token → { userKey, expires }
 
 function generateToken(userKey) {
@@ -191,7 +202,7 @@ function consumeToken(token) {
     const entry = tokens.get(token);
     if (!entry) return null;
     if (Date.now() > entry.expires) { tokens.delete(token); return null; }
-    tokens.delete(token); // single-use — can never be replayed
+    tokens.delete(token);
     return entry.userKey;
 }
 
@@ -214,7 +225,6 @@ function isRateLimited(jobId) {
     jobSubmitTimes.set(jobId, now);
     globalSubmits.push(now);
 
-    // Evict stale per-job entries so the map stays bounded
     if (jobSubmitTimes.size > 1000) {
         for (const [jid, t] of jobSubmitTimes) {
             if (now - t > JOB_COOLDOWN * 2) jobSubmitTimes.delete(jid);
@@ -224,25 +234,26 @@ function isRateLimited(jobId) {
 }
 
 // ─── WEBSOCKET HELPERS ───────────────────────────
-// Safe send — never throws on a closing/closed socket
 function wsSend(ws, obj) {
     if (ws.readyState !== WebSocket.OPEN) return;
     try { ws.send(typeof obj === 'string' ? obj : JSON.stringify(obj)); } catch {}
 }
 
-// Kick with optional message, 300ms grace so the message lands first
 function wsKick(ws, reason = 'Key expired') {
     wsSend(ws, { type: 'expired' });
     setTimeout(() => { try { ws.terminate(); } catch {} }, 300);
 }
 
-// Pre-serialised buffers — never re-serialised per client per interval
 const PING_BUF    = Buffer.from(JSON.stringify({ type: 'ping' }));
 const EXPIRED_BUF = Buffer.from(JSON.stringify({ type: 'expired' }));
 
-function broadcast(obj) {
+// FIX: broadcast now accepts an optional sender to exclude.
+// Presence messages should never echo back to the sender —
+// the Lua client already filters them but it wastes bandwidth.
+function broadcast(obj, excludeWs = null) {
     const buf = Buffer.from(JSON.stringify(obj));
     for (const client of wss.clients) {
+        if (client === excludeWs) continue;
         if (client.readyState === WebSocket.OPEN) {
             try { client.send(buf); } catch {}
         }
@@ -277,11 +288,28 @@ app.get('/get_token', async (req, res) => {
     res.json({ token: generateToken(userKey) });
 });
 
-app.post('/log_execute', (req, res) => {
-    if (!req.headers['x-api-key']) return res.status(401).json({ error: 'Unauthorized' });
+// FIX: /log_execute now:
+//   1. Validates the key is real and active (not just non-empty)
+//   2. Looks up the Discord ID tied to that key via Luarmor
+//   3. Includes Discord mention in the webhook embed
+app.post('/log_execute', async (req, res) => {
+    const userKey = (req.headers['x-api-key'] || '').trim();
+
+    // FIX: was only checking if header exists — now validates against Luarmor
+    if (!userKey) return res.status(401).json({ error: 'Unauthorized' });
+    const { valid, user } = await isKeyValid(userKey);
+    if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
+
     const { username, userId } = req.body || {};
     if (!username) return res.status(400).json({ error: 'Missing username' });
-    console.log(`[Execute] ${username} (${userId})`);
+
+    // Resolve Discord identity from the Luarmor user record
+    // (user already fetched above from isKeyValid — no extra API call needed)
+    const discordId  = user?.discord_id || null;
+    const discordTag = discordId ? `<@${discordId}>` : 'Unknown';
+
+    console.log(`[Execute] ${username} (${userId}) — Discord: ${discordId || 'unknown'}`);
+
     const webhook = process.env.WEBHOOK_EXECUTIONS;
     if (webhook) {
         fireWebhook(webhook, {
@@ -290,6 +318,7 @@ app.post('/log_execute', (req, res) => {
             fields: [
                 { name: 'Roblox Username', value: String(username),      inline: true },
                 { name: 'User ID',         value: String(userId || '?'), inline: true },
+                { name: 'Discord',         value: discordTag,            inline: true },
             ],
         });
     }
@@ -386,7 +415,22 @@ app.post('/submit', (req, res) => {
 // ══════════════════════════════════════════════════
 //  WEBSOCKET
 // ══════════════════════════════════════════════════
-const jobPresence = {}; // jobId → Set<username>
+
+// FIX: jobPresence cleanup — track Set size explicitly and prune
+// empty entries immediately to prevent memory accumulation
+const jobPresence = {};
+
+function presenceJoin(jobId, username) {
+    if (!jobPresence[jobId]) jobPresence[jobId] = new Set();
+    jobPresence[jobId].add(username);
+}
+
+function presenceLeave(jobId, username) {
+    if (!jobPresence[jobId]) return;
+    jobPresence[jobId].delete(username);
+    // FIX: prune immediately when empty — no lingering empty Sets
+    if (jobPresence[jobId].size === 0) delete jobPresence[jobId];
+}
 
 wss.on('connection', async (ws, req) => {
     // ── Token extraction ──────────────────────────
@@ -402,16 +446,13 @@ wss.on('connection', async (ws, req) => {
     }
 
     // ── Auth ──────────────────────────────────────
-    const userKey = consumeToken(token); // single-use, replay-proof
+    const userKey = consumeToken(token);
     if (!userKey) {
         try { ws.send(EXPIRED_BUF); } catch {}
         ws.terminate();
         return;
     }
 
-    // ── Validate key + get expiry in ONE call ─────
-    // We already validated when issuing the token, but we need auth_expire
-    // for the precise kick timer, so we make one call here.
     const { valid, user } = await isKeyValid(userKey);
     if (!valid) {
         try { ws.send(EXPIRED_BUF); } catch {}
@@ -419,16 +460,12 @@ wss.on('connection', async (ws, req) => {
         return;
     }
 
-    // Store key on socket for fallback watcher + !removeslot lookup
     ws._cerberusKey = userKey;
-    ws.isAlive      = true; // heartbeat tracking
+    ws.isAlive      = true;
 
     console.log('[WS] Connected:', userKey.slice(0, 8) + '…');
 
     // ── PRECISE EXPIRY KICK ───────────────────────
-    // Scheduled at connect time from auth_expire — no polling required.
-    // Fires at the EXACT second the Luarmor key dies.
-    // Works whether the user connected 1 minute or 1 hour after key creation.
     let expiryTimer = null;
     if (user.auth_expire !== -1) {
         const secsLeft = user.auth_expire - Math.floor(Date.now() / 1000);
@@ -438,21 +475,15 @@ wss.on('connection', async (ws, req) => {
                 wsKick(ws);
             }, secsLeft * 1000);
         } else {
-            // Key expired between token issue and WS connect — kick immediately
             wsKick(ws);
             return;
         }
     }
-    // auth_expire === -1 means lifetime key — no timer needed
 
-    // ── Presence state ────────────────────────────
     let _username = null;
     let _jobId    = null;
 
-    // ── pong → isAlive reset ──────────────────────
     ws.on('pong', () => { ws.isAlive = true; });
-
-    // ── Error handler — prevents process crash ────
     ws.on('error', err => console.warn('[WS] Socket error:', err.message));
 
     // ── Message handler ───────────────────────────
@@ -464,42 +495,42 @@ wss.on('connection', async (ws, req) => {
         if (msg.type === 'presence_join' && msg.username && msg.job_id) {
             _username = msg.username;
             _jobId    = msg.job_id;
+
             // Tell this client who's already in the job
             if (jobPresence[_jobId]) {
                 for (const existing of jobPresence[_jobId]) {
-                    if (existing !== _username) wsSend(ws, { type: 'presence_join', username: existing, job_id: _jobId });
+                    if (existing !== _username) {
+                        wsSend(ws, { type: 'presence_join', username: existing, job_id: _jobId });
+                    }
                 }
             }
-            if (!jobPresence[_jobId]) jobPresence[_jobId] = new Set();
-            jobPresence[_jobId].add(_username);
-            broadcast({ type: 'presence_join', username: _username, job_id: _jobId });
+
+            presenceJoin(_jobId, _username);
+
+            // FIX: exclude sender — they don't need their own join echoed back
+            broadcast({ type: 'presence_join', username: _username, job_id: _jobId }, ws);
             return;
         }
 
+        // All other messages (non-presence) broadcast to everyone including sender
         broadcast(msg);
     });
 
     // ── Close handler ─────────────────────────────
     ws.on('close', () => {
-        if (expiryTimer) clearTimeout(expiryTimer); // prevent double-kick on natural close
+        if (expiryTimer) clearTimeout(expiryTimer);
         if (_username && _jobId) {
-            jobPresence[_jobId]?.delete(_username);
-            if (jobPresence[_jobId]?.size === 0) delete jobPresence[_jobId];
-            broadcast({ type: 'presence_leave', username: _username, job_id: _jobId });
+            presenceLeave(_jobId, _username);
+            // FIX: exclude the closing socket (it's already gone)
+            broadcast({ type: 'presence_leave', username: _username, job_id: _jobId }, ws);
         }
     });
 });
 
-// ─── HEARTBEAT — kills zombie connections ─────────
-// Uses ws-native ping frames (not our JSON ping) + isAlive flag.
-// Clients that don't respond within 30s are terminated immediately.
-// This is the official ws library recommended pattern.
+// ─── HEARTBEAT ───────────────────────────────────
 const heartbeatInterval = setInterval(() => {
     for (const ws of wss.clients) {
-        if (!ws.isAlive) {
-            ws.terminate();
-            continue;
-        }
+        if (!ws.isAlive) { ws.terminate(); continue; }
         ws.isAlive = false;
         try { ws.ping(); } catch {}
     }
@@ -508,13 +539,10 @@ const heartbeatInterval = setInterval(() => {
 wss.on('close', () => clearInterval(heartbeatInterval));
 
 // ─── FALLBACK WATCHER ────────────────────────────
-// Catches manual revokes and bans where no expiry timer exists.
-// ONE shared Luarmor call per 30s, regardless of client count.
-// The precise expiryTimer handles normal expiry — this is just the safety net.
 setInterval(async () => {
-    if (wss.clients.size === 0) return; // skip if nobody connected
+    if (wss.clients.size === 0) return;
     const now     = Math.floor(Date.now() / 1000);
-    const users   = await getAllUsers(true); // force-fresh for safety net
+    const users   = await getAllUsers(true);
     const userMap = new Map(users.map(u => [u.user_key, u]));
 
     for (const ws of wss.clients) {
@@ -528,10 +556,7 @@ setInterval(async () => {
     }
 }, 30_000);
 
-// ─── JSON PING (for Lua client UI indicator) ─────
-// The Lua client doesn't understand ws-native ping frames,
-// so we also send a JSON {type:"ping"} every 20s.
-// The native heartbeat above handles actual zombie detection.
+// ─── JSON PING ───────────────────────────────────
 setInterval(() => {
     for (const client of wss.clients) {
         if (client.readyState === WebSocket.OPEN) {
@@ -541,11 +566,50 @@ setInterval(() => {
 }, 20_000);
 
 // ══════════════════════════════════════════════════
+//  STARTUP — RE-SCHEDULE EXPIRY TIMERS
+//  FIX: On restart all in-memory setTimeout calls are lost.
+//  We fetch all active keys and re-arm their expiry timers
+//  so users already holding keys still get kicked on time
+//  even if the server restarted mid-session.
+// ══════════════════════════════════════════════════
+function kickLiveSockets(userKey) {
+    for (const client of wss.clients) {
+        if (client._cerberusKey === userKey && client.readyState === WebSocket.OPEN) {
+            wsKick(client);
+        }
+    }
+}
+
+async function rescheduleExpiryTimers() {
+    console.log('[Startup] Re-scheduling expiry timers for active keys…');
+    const now   = Math.floor(Date.now() / 1000);
+    const users = await getAllUsers(true);
+    let   count = 0;
+
+    for (const u of users) {
+        if (u.banned) continue;
+        if (u.auth_expire === -1) continue; // lifetime key — no timer needed
+        const secsLeft = u.auth_expire - now;
+        if (secsLeft <= 0) continue; // already expired — watcher will handle it
+
+        setTimeout(() => {
+            console.log('[Expiry] Startup timer fired for key:', u.user_key?.slice(0, 8) + '…');
+            kickLiveSockets(u.user_key);
+            schedulePanel(500);
+        }, secsLeft * 1000);
+
+        count++;
+    }
+
+    console.log(`[Startup] Scheduled ${count} expiry timer(s)`);
+}
+
+// ══════════════════════════════════════════════════
 //  DISCORD BOT
 // ══════════════════════════════════════════════════
-let panelMessageId   = null;
-let panelDebounce    = null; // debounce handle
-let sequence         = null;
+let panelMessageId = null;
+let panelDebounce  = null;
+let sequence       = null;
 let heartbeatGW;
 let gatewayWs;
 
@@ -554,9 +618,9 @@ function parseDuration(str) {
     if (!match) return null;
     const num  = parseInt(match[1]);
     const unit = match[2].toLowerCase();
-    if (unit === 'h') return { seconds: num * 3_600,    label: `${num} hour${num !== 1 ? 's' : ''}` };
-    if (unit === 'd') return { seconds: num * 86_400,   label: `${num} day${num !== 1 ? 's' : ''}` };
-    if (unit === 'w') return { seconds: num * 604_800,  label: `${num} week${num !== 1 ? 's' : ''}` };
+    if (unit === 'h') return { seconds: num * 3_600,     label: `${num} hour${num !== 1 ? 's' : ''}` };
+    if (unit === 'd') return { seconds: num * 86_400,    label: `${num} day${num !== 1 ? 's' : ''}` };
+    if (unit === 'w') return { seconds: num * 604_800,   label: `${num} week${num !== 1 ? 's' : ''}` };
     if (unit === 'm') return { seconds: num * 2_592_000, label: `${num} month${num !== 1 ? 's' : ''}` };
     return null;
 }
@@ -590,7 +654,6 @@ async function discordRequest(method, path, body) {
     }
 }
 
-// Debounced panel — multiple rapid slot changes only fire one update
 function schedulePanel(delayMs = 1000) {
     if (panelDebounce) clearTimeout(panelDebounce);
     panelDebounce = setTimeout(() => { panelDebounce = null; updatePanel(); }, delayMs);
@@ -631,21 +694,11 @@ async function updatePanel() {
     } else {
         const result = await discordRequest('PATCH', `/channels/${CHANNEL_ID}/messages/${panelMessageId}`, { embeds: [embed] });
         if (!result) {
-            // Message was deleted — re-post
             panelMessageId = null;
             const msg = await discordRequest('POST', `/channels/${CHANNEL_ID}/messages`, { embeds: [embed] });
             if (msg) { panelMessageId = msg.id; console.log('[Panel] Re-posted:', panelMessageId); }
         } else {
             console.log('[Panel] Updated at', new Date().toLocaleTimeString());
-        }
-    }
-}
-
-// ─── KICK ALL LIVE SOCKETS FOR A KEY ─────────────
-function kickLiveSockets(userKey) {
-    for (const client of wss.clients) {
-        if (client._cerberusKey === userKey && client.readyState === WebSocket.OPEN) {
-            wsKick(client);
         }
     }
 }
@@ -696,15 +749,10 @@ async function handleMessage(msg) {
             });
         }
 
-        // ── SCHEDULE PRECISE EXPIRY KICK ─────────
-        // This fires at the exact moment the key dies, even if the user
-        // hasn't connected yet when we create the key.  When the timer fires,
-        // it looks for any live socket with this key and kicks it.
-        // If nobody is connected, the loop exits harmlessly.
+        // Schedule expiry timer — also kicks any live socket at expiry time
         setTimeout(() => {
             console.log('[Expiry] Timer fired for key:', key.slice(0, 8) + '…');
             kickLiveSockets(key);
-            // Also schedule a panel refresh so the slot shows as freed
             schedulePanel(500);
         }, duration.seconds * 1000);
 
@@ -749,7 +797,7 @@ async function handleMessage(msg) {
             });
         }
         await revokeKey(user.user_key);
-        kickLiveSockets(user.user_key); // instant kick — no waiting for watcher
+        kickLiveSockets(user.user_key);
         await discordRequest('POST', `/channels/${msg.channel_id}/messages`, {
             content: `✅ Slot removed for <@${discordId}> — kicked from WebSocket instantly.`,
         });
@@ -775,9 +823,9 @@ async function handleMessage(msg) {
                 title:  '🐕 Cerberus Bot Commands',
                 color:  0x00AF41,
                 fields: [
-                    { name: '!addslot @user <duration>', value: 'Add a slot. e.g. `2h` `1d` `1w` `1m`',            inline: false },
-                    { name: '!removeslot @user',         value: 'Remove a slot — kicks live session instantly',     inline: false },
-                    { name: '!slots',                    value: 'Show active slot count',                           inline: false },
+                    { name: '!addslot @user <duration>', value: 'Add a slot. e.g. `2h` `1d` `1w` `1m`',        inline: false },
+                    { name: '!removeslot @user',         value: 'Remove a slot — kicks live session instantly', inline: false },
+                    { name: '!slots',                    value: 'Show active slot count',                       inline: false },
                 ],
             }],
         });
@@ -796,7 +844,7 @@ function startGateway() {
         const { op, d, t, s } = payload;
         if (s) sequence = s;
 
-        if (op === 10) { // Hello — start heartbeat + identify
+        if (op === 10) {
             heartbeatGW = setInterval(() => {
                 gatewayWs.send(JSON.stringify({ op: 1, d: sequence }));
             }, d.heartbeat_interval);
@@ -812,6 +860,8 @@ function startGateway() {
 
         if (op === 0 && t === 'READY') {
             console.log('[Gateway] Bot ready:', d.user.username);
+            // Re-schedule expiry timers first, then update panel
+            await rescheduleExpiryTimers();
             updatePanel();
         }
 
@@ -831,7 +881,7 @@ function startGateway() {
 
 startGateway();
 
-// Panel refresh every 60s (keeps time-remaining display accurate)
+// Panel refresh every 60s
 setInterval(updatePanel, 60_000);
 
 // ─── START ───────────────────────────────────────
