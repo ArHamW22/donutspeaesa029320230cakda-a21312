@@ -1,16 +1,5 @@
-// ══════════════════════════════════════════════════
+8// ══════════════════════════════════════════════════
 //  CERBERUS — server.js
-//  Fixed build:
-//  • /log_execute resolves Discord username from key
-//  • /log_execute validates key before accepting
-//  • Expiry timers re-scheduled on startup (survive restarts)
-//  • broadcast skips sender for presence messages
-//  • jobPresence memory leak fixed
-//  • Express 5 aligned in package.json
-//  • Node >=18 enforced via engines field
-//  • FIXED: removed redundant isKeyValid call on WS connect
-//    (token already proves key is valid — double-call was
-//     causing immediate disconnects if Luarmor was slow)
 // ══════════════════════════════════════════════════
 'use strict';
 
@@ -65,15 +54,17 @@ const LRM_KEY    = process.env.LRM_KEY;
 const LRM_PID    = process.env.LRM_PID;
 const BOT_TOKEN  = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const FETCHER_URL = process.env.FETCHER_URL || 'http://82.11.247.18:5000';
 const MAX_SLOTS  = 7;
 const LOGO_URL   = 'https://media.discordapp.net/attachments/1487763701040680971/1489669239202644089/image.png';
 const ADMIN_IDS  = new Set(['1405960794503647324']);
 
-console.log('[ENV] API_KEY set:',   !!API_KEY);
-console.log('[ENV] LRM_KEY set:',   !!LRM_KEY);
-console.log('[ENV] LRM_PID:',        LRM_PID);
-console.log('[ENV] BOT_TOKEN set:', !!BOT_TOKEN);
-console.log('[ENV] CHANNEL_ID:',     CHANNEL_ID);
+console.log('[ENV] API_KEY set:',    !!API_KEY);
+console.log('[ENV] LRM_KEY set:',    !!LRM_KEY);
+console.log('[ENV] LRM_PID:',         LRM_PID);
+console.log('[ENV] BOT_TOKEN set:',  !!BOT_TOKEN);
+console.log('[ENV] CHANNEL_ID:',      CHANNEL_ID);
+console.log('[ENV] FETCHER_URL:',     FETCHER_URL);
 if (!process.env.WEBHOOK_50_400M)    console.warn('[ENV] WARNING: WEBHOOK_50_400M not set');
 if (!process.env.WEBHOOK_400_999M)   console.warn('[ENV] WARNING: WEBHOOK_400_999M not set');
 if (!process.env.WEBHOOK_999M_PLUS)  console.warn('[ENV] WARNING: WEBHOOK_999M_PLUS not set');
@@ -133,21 +124,6 @@ async function isKeyValid(key) {
     }
 }
 
-async function getUserByKey(userKey) {
-    try {
-        const res = await luarmorFetch(
-            `https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(userKey)}`,
-            { headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' } },
-        );
-        if (!res.ok) return null;
-        const d = await res.json();
-        if (!d.success || !d.users?.length) return null;
-        return d.users[0];
-    } catch {
-        return null;
-    }
-}
-
 async function createKey(durationSeconds, discordId, label) {
     const auth_expire = Math.floor(Date.now() / 1000) + durationSeconds;
     try {
@@ -189,9 +165,7 @@ async function getKeyByDiscordId(discordId) {
 }
 
 // ─── TOKEN SYSTEM ────────────────────────────────
-// Tokens now store the full user object so WS connect
-// can use it directly without a second Luarmor call.
-const tokens = new Map(); // token → { userKey, user, expires }
+const tokens = new Map();
 
 function generateToken(userKey, user) {
     const token   = crypto.randomBytes(32).toString('hex');
@@ -207,7 +181,7 @@ function consumeToken(token) {
     if (!entry) return null;
     if (Date.now() > entry.expires) { tokens.delete(token); return null; }
     tokens.delete(token);
-    return entry; // returns { userKey, user }
+    return entry;
 }
 
 // ─── RATE LIMITING ───────────────────────────────
@@ -221,14 +195,11 @@ function isRateLimited(jobId) {
     const now     = Date.now();
     const lastJob = jobSubmitTimes.get(jobId);
     if (lastJob && now - lastJob < JOB_COOLDOWN) return true;
-
     const cutoff = now - GLOBAL_WINDOW;
     while (globalSubmits.length && globalSubmits[0] < cutoff) globalSubmits.shift();
     if (globalSubmits.length >= GLOBAL_MAX) return true;
-
     jobSubmitTimes.set(jobId, now);
     globalSubmits.push(now);
-
     if (jobSubmitTimes.size > 1000) {
         for (const [jid, t] of jobSubmitTimes) {
             if (now - t > JOB_COOLDOWN * 2) jobSubmitTimes.delete(jid);
@@ -243,7 +214,7 @@ function wsSend(ws, obj) {
     try { ws.send(typeof obj === 'string' ? obj : JSON.stringify(obj)); } catch {}
 }
 
-function wsKick(ws, reason = 'Key expired') {
+function wsKick(ws) {
     wsSend(ws, { type: 'expired' });
     setTimeout(() => { try { ws.terminate(); } catch {} }, 300);
 }
@@ -277,16 +248,158 @@ function fireWebhook(webhook, embedData) {
     }).catch(e => console.warn('[Webhook] Failed:', e.message));
 }
 
+// ══════════════════════════════════════════════════
+//  BOT JOB TRACKING — prevents bots sharing servers
+// ══════════════════════════════════════════════════
+// Maps job_id -> Set of bot identifiers currently in that server.
+// When a bot is in job X, no other bot will be sent to job X.
+const botJobMap  = new Map(); // job_id -> Set<userKey>
+const botCurrent = new Map(); // userKey -> job_id  (where that bot currently is)
+
+function botJoin(userKey, jobId) {
+    // Leave old server first
+    botLeave(userKey);
+    botCurrent.set(userKey, jobId);
+    if (!botJobMap.has(jobId)) botJobMap.set(jobId, new Set());
+    botJobMap.get(jobId).add(userKey);
+    console.log(`[BotTrack] ${userKey.slice(0,8)}… joined ${jobId} | occupied: ${botJobMap.size} servers`);
+}
+
+function botLeave(userKey) {
+    const oldJob = botCurrent.get(userKey);
+    if (!oldJob) return;
+    botCurrent.delete(userKey);
+    const set = botJobMap.get(oldJob);
+    if (set) {
+        set.delete(userKey);
+        if (set.size === 0) botJobMap.delete(oldJob);
+    }
+}
+
+function isJobOccupied(jobId) {
+    const set = botJobMap.get(jobId);
+    return set && set.size > 0;
+}
+
+// ── Fetcher proxy — get next server, skipping occupied ones ──
+async function getNextServerFromFetcher(requestingUserKey) {
+    // We may need to ask the fetcher multiple times to skip occupied jobs.
+    // We'll try up to 10 times then give up.
+    const skipped = [];
+    for (let i = 0; i < 10; i++) {
+        let data;
+        try {
+            const res = await axios.get(`${FETCHER_URL}/next_server`, { timeout: 8_000 });
+            data = res.data;
+        } catch (e) {
+            console.warn('[Fetcher proxy] Error:', e.message);
+            return null;
+        }
+
+        if (!data || data.error || !data.job_id) return null;
+
+        const jobId = data.job_id;
+
+        if (!isJobOccupied(jobId)) {
+            // Good — mark it back as visited on fetcher for any others
+            // (fetcher already removed it from queue, so nothing extra needed)
+            console.log(`[Fetcher proxy] Giving ${jobId} to ${requestingUserKey.slice(0,8)}… (skipped ${skipped.length})`);
+            return jobId;
+        }
+
+        // Occupied — mark visited on fetcher so it doesn't come back, try again
+        console.log(`[Fetcher proxy] ${jobId} occupied — skipping`);
+        skipped.push(jobId);
+        try {
+            await axios.post(`${FETCHER_URL}/visited`, { job_id: jobId }, { timeout: 4_000 });
+        } catch {}
+    }
+
+    console.warn('[Fetcher proxy] Could not find unoccupied server after 10 attempts');
+    return null;
+}
+
+// ══════════════════════════════════════════════════
+//  SCAN COORDINATION
+// ══════════════════════════════════════════════════
+// After a bot scans a server it calls /scan_done.
+// Server.js broadcasts the result to GUI clients then
+// immediately approves the hop via /should_hop polling.
+const hopApproved = new Set(); // job_ids approved to hop
+
+app.post('/scan_done', (req, res) => {
+    if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    const { job_id, found_count, players } = req.body || {};
+    if (!job_id) return res.status(400).json({ error: 'Missing job_id' });
+
+    console.log(`[Scan] job=${job_id} found=${found_count ?? 0} players=${players ?? '?'}`);
+
+    // Tell all GUI clients about this scan result
+    broadcast({
+        type:        'scan_result',
+        job_id,
+        found_count: found_count ?? 0,
+        players:     players ?? 0,
+    });
+
+    // Approve hop
+    hopApproved.add(job_id);
+    // Clean up after 5 minutes
+    setTimeout(() => hopApproved.delete(job_id), 300_000);
+
+    res.json({ ok: true });
+});
+
+app.get('/should_hop', (req, res) => {
+    if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    const jobId = (req.query.job_id || '').trim();
+    if (!jobId) return res.status(400).json({ error: 'Missing job_id' });
+
+    if (hopApproved.has(jobId)) {
+        hopApproved.delete(jobId);
+        return res.json({ hop: true });
+    }
+    res.json({ hop: false });
+});
+
+// ── Proxied next_server for Lua bots ─────────────
+// Lua calls this instead of the fetcher directly so
+// server.js can enforce bot isolation.
+app.get('/next_server', async (req, res) => {
+    if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    const userKey = (req.query.user_key || '').trim();
+    if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
+
+    const jobId = await getNextServerFromFetcher(userKey);
+    if (!jobId) return res.status(503).json({ error: 'no servers available' });
+
+    res.json({ job_id: jobId });
+});
+
+// ── Bot presence tracking (called by Lua) ─────────
+app.post('/bot_join', (req, res) => {
+    if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    const { job_id, user_key } = req.body || {};
+    if (!job_id || !user_key) return res.status(400).json({ error: 'Missing job_id or user_key' });
+    botJoin(user_key, job_id);
+    res.json({ ok: true });
+});
+
+app.post('/bot_leave', (req, res) => {
+    if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+    const { job_id, user_key } = req.body || {};
+    if (!user_key) return res.status(400).json({ error: 'Missing user_key' });
+    botLeave(user_key);
+    res.json({ ok: true });
+});
+
 // ─── ROUTES ──────────────────────────────────────
 app.get('/get_token', async (req, res) => {
     const userKey = (req.query.user_key || '').trim();
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
-
     const { valid, user } = await isKeyValid(userKey);
     if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
-
     console.log('[Token] Issued for key:', userKey.slice(0, 8) + '…');
-    // FIX: pass user object into token so WS connect doesn't need to re-fetch
     res.json({ token: generateToken(userKey, user) });
 });
 
@@ -295,15 +408,11 @@ app.post('/log_execute', async (req, res) => {
     if (!userKey) return res.status(401).json({ error: 'Unauthorized' });
     const { valid, user } = await isKeyValid(userKey);
     if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
-
     const { username, userId } = req.body || {};
     if (!username) return res.status(400).json({ error: 'Missing username' });
-
     const discordId  = user?.discord_id || null;
     const discordTag = discordId ? `<@${discordId}>` : 'Unknown';
-
     console.log(`[Execute] ${username} (${userId}) — Discord: ${discordId || 'unknown'}`);
-
     const webhook = process.env.WEBHOOK_EXECUTIONS;
     if (webhook) {
         fireWebhook(webhook, {
@@ -324,14 +433,11 @@ app.post('/submit_batch', (req, res) => {
     const b = req.body;
     if (!b?.pets || !Array.isArray(b.pets) || b.pets.length === 0)
         return res.status(400).json({ error: 'Missing pets array' });
-
     const jobId = b.job_id || 'unknown';
     if (isRateLimited(jobId)) return res.status(429).json({ error: 'Rate limited' });
-
     const pets    = [...b.pets].sort((a, b) => (b.value || 0) - (a.value || 0));
     const best    = pets[0];
     const bestVal = parseFloat(String(best.value || 0));
-
     for (const pet of pets) {
         broadcast({
             type: 'brainrot', name: pet.name,
@@ -339,14 +445,11 @@ app.post('/submit_batch', (req, res) => {
             value: pet.value || 0, job_id: b.job_id || '', place_id: b.place_id || '',
         });
     }
-
     let webhook = null;
     if      (bestVal >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
     else if (bestVal >= 400e6) webhook = process.env.WEBHOOK_400_999M;
     else if (bestVal >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
-
     console.log(`[Batch] ${pets.length} pets | best=${best.name} val=${bestVal} | webhook=${webhook ? 'yes' : 'no'}`);
-
     if (webhook) {
         const bestMut = best.mutation && best.mutation !== 'None' ? best.mutation : 'Base';
         const color   = bestVal >= 999e6 ? 0xFFD700 : bestVal >= 400e6 ? 0x00BFFF : 0x00AF41;
@@ -378,19 +481,16 @@ app.post('/submit', (req, res) => {
     if (!b?.name) return res.status(400).json({ error: 'Missing name' });
     const jobId = b.job_id || 'unknown';
     if (isRateLimited(jobId)) return res.status(429).json({ error: 'Rate limited' });
-
     broadcast({
         type: 'brainrot', name: b.name,
         gen: b.gen || '?', mutation: b.mutation || 'None',
         value: b.value || 0, job_id: b.job_id || '', place_id: b.place_id || '',
     });
-
     const val = parseFloat(String(b.value || 0));
     let webhook = null;
     if      (val >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
     else if (val >= 400e6) webhook = process.env.WEBHOOK_400_999M;
     else if (val >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
-
     if (webhook) {
         const mut = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
         fireWebhook(webhook, {
@@ -423,7 +523,6 @@ function presenceLeave(jobId, username) {
 }
 
 wss.on('connection', async (ws, req) => {
-    // ── Token extraction ──────────────────────────
     const rawUrl = req.url || '/';
     let token    = null;
     const qi     = rawUrl.indexOf('?');
@@ -435,12 +534,6 @@ wss.on('connection', async (ws, req) => {
         if (proto) token = proto.split(',')[0].trim() || null;
     }
 
-    // ── Auth ──────────────────────────────────────
-    // FIX: consumeToken now returns { userKey, user } so we skip the
-    // second Luarmor API call that was causing immediate disconnects.
-    // The token was already validated against Luarmor at /get_token
-    // (max 60 seconds ago) so re-validating here is redundant and
-    // was the root cause of the "Disconnected" issue.
     const entry = consumeToken(token);
     if (!entry) {
         try { ws.send(EXPIRED_BUF); } catch {}
@@ -449,15 +542,12 @@ wss.on('connection', async (ws, req) => {
     }
 
     const { userKey, user } = entry;
-
     ws._cerberusKey = userKey;
-    ws._authExpire  = user ? user.auth_expire : null; // used by 5s in-memory watcher
+    ws._authExpire  = user ? user.auth_expire : null;
     ws.isAlive      = true;
 
     console.log('[WS] Connected:', userKey.slice(0, 8) + '…');
 
-    // ── PRECISE EXPIRY KICK ───────────────────────
-    // Still schedule expiry kick using the user object we already have
     let expiryTimer = null;
     if (user && user.auth_expire !== -1) {
         const secsLeft = user.auth_expire - Math.floor(Date.now() / 1000);
@@ -478,7 +568,6 @@ wss.on('connection', async (ws, req) => {
     ws.on('pong', () => { ws.isAlive = true; });
     ws.on('error', err => console.warn('[WS] Socket error:', err.message));
 
-    // ── Message handler ───────────────────────────
     ws.on('message', data => {
         let msg;
         try { msg = JSON.parse(data); } catch { return; }
@@ -487,7 +576,6 @@ wss.on('connection', async (ws, req) => {
         if (msg.type === 'presence_join' && msg.username && msg.job_id) {
             _username = msg.username;
             _jobId    = msg.job_id;
-
             if (jobPresence[_jobId]) {
                 for (const existing of jobPresence[_jobId]) {
                     if (existing !== _username) {
@@ -495,7 +583,6 @@ wss.on('connection', async (ws, req) => {
                     }
                 }
             }
-
             presenceJoin(_jobId, _username);
             broadcast({ type: 'presence_join', username: _username, job_id: _jobId }, ws);
             return;
@@ -504,9 +591,10 @@ wss.on('connection', async (ws, req) => {
         broadcast(msg);
     });
 
-    // ── Close handler ─────────────────────────────
     ws.on('close', () => {
         if (expiryTimer) clearTimeout(expiryTimer);
+        // Clean up bot tracking on disconnect
+        botLeave(userKey);
         if (_username && _jobId) {
             presenceLeave(_jobId, _username);
             broadcast({ type: 'presence_leave', username: _username, job_id: _jobId }, ws);
@@ -526,11 +614,6 @@ const heartbeatInterval = setInterval(() => {
 wss.on('close', () => clearInterval(heartbeatInterval));
 
 // ─── FALLBACK WATCHER ────────────────────────────
-// Two-tier approach:
-//   • Every 5s: cheap in-memory expiry check (no API call) — catches
-//     the exact second auth_expire passes for any connected socket.
-//   • Every 60s: full Luarmor re-fetch — catches bans and any external
-//     key changes made on the Luarmor dashboard.
 setInterval(() => {
     if (wss.clients.size === 0) return;
     const now = Math.floor(Date.now() / 1000);
@@ -548,16 +631,14 @@ setInterval(async () => {
     const now     = Math.floor(Date.now() / 1000);
     const users   = await getAllUsers(true);
     const userMap = new Map(users.map(u => [u.user_key, u]));
-
     for (const ws of wss.clients) {
         if (ws.readyState !== WebSocket.OPEN || !ws._cerberusKey) continue;
         const u     = userMap.get(ws._cerberusKey);
         const valid = u && !u.banned && (u.auth_expire === -1 || u.auth_expire > now);
         if (!valid) {
-            console.log('[Watcher] Luarmor kick (banned/changed):', ws._cerberusKey?.slice(0, 8) + '…');
+            console.log('[Watcher] Luarmor kick:', ws._cerberusKey?.slice(0, 8) + '…');
             wsKick(ws);
         }
-        // Keep in-memory expiry in sync with Luarmor in case it changed
         if (u) ws._authExpire = u.auth_expire;
     }
 }, 60_000);
@@ -583,26 +664,22 @@ function kickLiveSockets(userKey) {
 }
 
 async function rescheduleExpiryTimers() {
-    console.log('[Startup] Re-scheduling expiry timers for active keys…');
+    console.log('[Startup] Re-scheduling expiry timers…');
     const now   = Math.floor(Date.now() / 1000);
     const users = await getAllUsers(true);
     let   count = 0;
-
     for (const u of users) {
         if (u.banned) continue;
         if (u.auth_expire === -1) continue;
         const secsLeft = u.auth_expire - now;
         if (secsLeft <= 0) continue;
-
         setTimeout(() => {
-            console.log('[Expiry] Startup timer fired for key:', u.user_key?.slice(0, 8) + '…');
+            console.log('[Expiry] Startup timer fired:', u.user_key?.slice(0, 8) + '…');
             kickLiveSockets(u.user_key);
             schedulePanel(500);
         }, secsLeft * 1000);
-
         count++;
     }
-
     console.log(`[Startup] Scheduled ${count} expiry timer(s)`);
 }
 
@@ -667,15 +744,13 @@ async function updatePanel() {
     const active = users.filter(u => !u.banned && (u.auth_expire === -1 || u.auth_expire > now));
     const used   = active.length;
     const full   = used >= MAX_SLOTS;
-
-    const lines = active.length > 0
+    const lines  = active.length > 0
         ? active.map((u, i) => {
             const tag  = u.discord_id ? `<@${u.discord_id}>` : `\`${u.user_key.slice(0, 8)}…\``;
             const time = u.auth_expire === -1 ? '∞' : formatTime(u.auth_expire - now);
             return `${i + 1}. ${tag} → ${time}`;
         }).join('\n')
         : '*No active slots.*';
-
     const embed = {
         title:       `🔴 Cerberus Notifier Active Slots (${used}/${MAX_SLOTS})`,
         description: lines + (full ? '\n\n**All slots are full at the moment.**' : ''),
@@ -689,7 +764,6 @@ async function updatePanel() {
             inline: false,
         }],
     };
-
     if (!panelMessageId) {
         const msg = await discordRequest('POST', `/channels/${CHANNEL_ID}/messages`, { embeds: [embed] });
         if (msg) { panelMessageId = msg.id; console.log('[Panel] Posted:', panelMessageId); }
@@ -705,13 +779,11 @@ async function updatePanel() {
     }
 }
 
-// ─── COMMAND HANDLER ─────────────────────────────
 async function handleMessage(msg) {
     if (msg.author?.bot) return;
     const content = msg.content?.trim();
     if (!content?.startsWith('!')) return;
     if (!ADMIN_IDS.has(msg.author.id)) return;
-
     const parts = content.split(/\s+/).filter(Boolean);
     const cmd   = parts[0].toLowerCase();
 
@@ -742,20 +814,17 @@ async function handleMessage(msg) {
                 content: `❌ <@${discordId}> already has an active slot.`,
             });
         }
-
         const key = await createKey(duration.seconds, discordId, duration.label);
         if (!key) {
             return discordRequest('POST', `/channels/${msg.channel_id}/messages`, {
                 content: '❌ Failed to create key on Luarmor.',
             });
         }
-
         setTimeout(() => {
             console.log('[Expiry] Timer fired for key:', key.slice(0, 8) + '…');
             kickLiveSockets(key);
             schedulePanel(500);
         }, duration.seconds * 1000);
-
         const dmChannel = await discordRequest('POST', '/users/@me/channels', { recipient_id: discordId });
         if (dmChannel) {
             await discordRequest('POST', `/channels/${dmChannel.id}/messages`, {
@@ -772,7 +841,6 @@ async function handleMessage(msg) {
                 }],
             });
         }
-
         await discordRequest('POST', `/channels/${msg.channel_id}/messages`, {
             content: `✅ Slot added for <@${discordId}> — **${duration.label}**. Key sent via DM.`,
         });
@@ -828,18 +896,14 @@ async function handleMessage(msg) {
     }
 }
 
-// ─── DISCORD GATEWAY ─────────────────────────────
 function startGateway() {
     gatewayWs = new WebSocket('wss://gateway.discord.gg/?v=10&encoding=json');
-
     gatewayWs.on('open', () => console.log('[Gateway] Connected'));
-
     gatewayWs.on('message', async data => {
         let payload;
         try { payload = JSON.parse(data); } catch { return; }
         const { op, d, t, s } = payload;
         if (s) sequence = s;
-
         if (op === 10) {
             heartbeatGW = setInterval(() => {
                 gatewayWs.send(JSON.stringify({ op: 1, d: sequence }));
@@ -853,31 +917,25 @@ function startGateway() {
                 },
             }));
         }
-
         if (op === 0 && t === 'READY') {
             console.log('[Gateway] Bot ready:', d.user.username);
             await rescheduleExpiryTimers();
             updatePanel();
         }
-
         if (op === 0 && t === 'MESSAGE_CREATE') {
             await handleMessage(d);
         }
     });
-
     gatewayWs.on('close', code => {
         console.warn('[Gateway] Closed:', code, '— reconnecting in 5s');
         clearInterval(heartbeatGW);
         setTimeout(startGateway, 5000);
     });
-
     gatewayWs.on('error', err => console.error('[Gateway] Error:', err.message));
 }
 
 startGateway();
-
 setInterval(updatePanel, 60_000);
 
-// ─── START ───────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`[Cerberus] Running on port ${PORT}`));
