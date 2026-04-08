@@ -1,5 +1,5 @@
 // ══════════════════════════════════════════════════
-//  CERBERUS — server.js  (fixed build)
+//  CERBERUS — server.js
 // ══════════════════════════════════════════════════
 'use strict';
 
@@ -78,7 +78,6 @@ if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
 app.get('/', (_req, res) => res.send('online'));
 
 // ─── GEN RATE PARSER ─────────────────────────────
-// Returns raw numeric value: $600M/s → 600000000
 function parseGen(raw) {
     if (!raw || raw === '?' || raw === '') return 0;
     const s = String(raw).toLowerCase().replace(/[\$,\s%]/g, '').replace(/\/s$/, '');
@@ -87,6 +86,24 @@ function parseGen(raw) {
     if (s.includes('m')) return n * 1e6;
     if (s.includes('k')) return n * 1e3;
     return n;
+}
+
+// ─── WIKI IMAGE FETCH (server-side fallback) ──────
+async function fetchWikiImage(petName) {
+    try {
+        const encoded = encodeURIComponent(petName.replace(/ /g, '_'));
+        const url = `https://stealabrainrot.fandom.com/api.php?action=query&prop=pageimages&format=json&piprop=thumbnail&pithumbsize=500&titles=${encoded}`;
+        const res = await axios.get(url, { timeout: 8_000 });
+        const pages = res.data?.query?.pages;
+        if (pages) {
+            for (const page of Object.values(pages)) {
+                if (page.thumbnail?.source) return page.thumbnail.source;
+            }
+        }
+    } catch (e) {
+        console.warn('[Wiki] Image fetch failed:', e.message);
+    }
+    return null;
 }
 
 // ─── LUARMOR — CACHED USER LIST ──────────────────
@@ -197,13 +214,9 @@ function consumeToken(token) {
 }
 
 // ─── RATE LIMITING ───────────────────────────────
-// FIX: Rate limit is now PER-SERVER (not per-pet).
-// This means all pets in a single batch from a server always show up.
-// The cooldown only blocks re-submissions from the SAME server within 30s
-// (prevents duplicate webhooks if a bot re-executes on the same server).
 const serverSubmitTimes = new Map();
 const globalSubmits     = [];
-const SERVER_COOLDOWN   = 30_000;   // 30 seconds per server
+const SERVER_COOLDOWN   = 30_000;
 const GLOBAL_MAX        = 200;
 const GLOBAL_WINDOW     = 3_600_000;
 
@@ -398,7 +411,7 @@ app.post('/log_execute', async (req, res) => {
     if (webhook) {
         fireWebhook(webhook, {
             title:  '🎮 Cerberus Execution',
-            color:  3066993,
+            color:  0x9B59B6,
             fields: [
                 { name: 'Roblox Username', value: String(username),      inline: true },
                 { name: 'User ID',         value: String(userId || '?'), inline: true },
@@ -410,29 +423,24 @@ app.post('/log_execute', async (req, res) => {
 });
 
 // ── /submit_batch ─────────────────────────────────
-// FIX: Rate limit is now per-server. All pets in a batch are always
-// broadcast and shown in the webhook — no more pets being filtered out.
-app.post('/submit_batch', (req, res) => {
+app.post('/submit_batch', async (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const b = req.body;
     if (!b?.pets || !Array.isArray(b.pets) || b.pets.length === 0)
         return res.status(400).json({ error: 'Missing pets array' });
     const jobId = b.job_id || 'unknown';
 
-    // Block re-submission from the same server within 30s
     if (isServerRateLimited(jobId)) {
         console.log(`[Batch] Rate limited server: ${jobId}`);
         return res.status(429).json({ error: 'Rate limited' });
     }
 
-    // Sort ALL pets by gen rate descending
     const pets    = [...b.pets].sort((a, bb) => parseGen(bb.gen) - parseGen(a.gen));
     const best    = pets[0];
     const bestGen = parseGen(best.gen);
 
     console.log(`[Batch] ${pets.length} pets | best=${best.name} gen=${best.gen} (${bestGen})`);
 
-    // Broadcast ALL pets individually to WebSocket clients
     for (const pet of pets) {
         broadcast({
             type:     'brainrot',
@@ -445,7 +453,6 @@ app.post('/submit_batch', (req, res) => {
         });
     }
 
-    // Webhook tier routing by gen rate
     let webhook = null;
     if      (bestGen >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
     else if (bestGen >= 400e6) webhook = process.env.WEBHOOK_400_999M;
@@ -454,12 +461,21 @@ app.post('/submit_batch', (req, res) => {
     console.log(`[Batch] webhook tier: ${webhook ? 'yes' : 'no (below 50M)'}`);
 
     if (webhook) {
+        // Use client image, fall back to server-side wiki fetch
+        let imageUrl = b.image_url || null;
+        console.log(`[Batch] client image_url: ${imageUrl}`);
+        if (!imageUrl) {
+            console.log(`[Batch] Fetching wiki image for: ${best.name}`);
+            for (const pet of pets) {
+                imageUrl = await fetchWikiImage(pet.name);
+                if (imageUrl) break;
+            }
+        }
+        console.log(`[Batch] final image_url: ${imageUrl}`);
+
         const bestMut = best.mutation && best.mutation !== 'None' ? best.mutation : 'Base';
-        const color   = bestGen >= 999e6 ? 0xFFD700 : bestGen >= 400e6 ? 0x00BFFF : 0x00AF41;
 
         let desc = `🏆 **Best**\n[${bestMut}] ${best.name} [${displayGen(best.gen)}]`;
-
-        // Show ALL other pets (no filtering — all came from one server scan)
         const others = pets.slice(1);
         if (others.length > 0) {
             desc += '\n\n♦ **Others**';
@@ -473,8 +489,8 @@ app.post('/submit_batch', (req, res) => {
         fireWebhook(webhook, {
             title:       '⭐ Cerberus Notifier | Finds',
             description: desc.slice(0, 3900),
-            color,
-            thumbnail:   b.image_url ? { url: b.image_url } : undefined,
+            color:       0x9B59B6,
+            thumbnail:   imageUrl ? { url: imageUrl } : undefined,
             fields:      [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
             footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
             timestamp:   new Date().toISOString(),
@@ -484,7 +500,7 @@ app.post('/submit_batch', (req, res) => {
 });
 
 // ── /submit (single pet) ─────────────────────────
-app.post('/submit', (req, res) => {
+app.post('/submit', async (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const b = req.body;
     if (!b?.name) return res.status(400).json({ error: 'Missing name' });
@@ -507,12 +523,16 @@ app.post('/submit', (req, res) => {
     console.log(`[Submit] ${b.name} | gen=${b.gen} (${genVal}) | webhook=${webhook ? 'yes' : 'no'}`);
 
     if (webhook) {
+        let imageUrl = b.image_url || null;
+        if (!imageUrl) imageUrl = await fetchWikiImage(b.name);
+        console.log(`[Submit] image_url: ${imageUrl}`);
+
         const mut = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
         fireWebhook(webhook, {
             title:       '⭐ Cerberus Notifier | Find',
             description: `🏆 **Best**\n[${mut}] ${b.name} [${displayGen(b.gen)}]\n\n💸 **Buy a Slot!**`,
-            color:       genVal >= 999e6 ? 0xFFD700 : genVal >= 400e6 ? 0x00BFFF : 0x00AF41,
-            thumbnail:   b.image_url ? { url: b.image_url } : undefined,
+            color:       0x9B59B6,
+            thumbnail:   imageUrl ? { url: imageUrl } : undefined,
             fields:      [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
             footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
             timestamp:   new Date().toISOString(),
@@ -768,7 +788,7 @@ async function updatePanel() {
     const embed = {
         title:       `🔴 Cerberus Notifier Active Slots (${used}/${MAX_SLOTS})`,
         description: lines + (full ? '\n\n**All slots are full at the moment.**' : ''),
-        color:       full ? 0xDE3163 : 0x00AF41,
+        color:       0x9B59B6,
         thumbnail:   { url: LOGO_URL },
         footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
         timestamp:   new Date().toISOString(),
@@ -845,7 +865,7 @@ async function handleMessage(msg) {
                 embeds: [{
                     title:       '🐕 Cerberus Notifier — Your Key',
                     description: `Your slot is active for **${duration.label}**.\n\nHead to the 📡・finder-panel in the Discord server and redeem your key to get started.`,
-                    color:       0x00AF41,
+                    color:       0x9B59B6,
                     thumbnail:   { url: LOGO_URL },
                     fields: [
                         { name: '🔑 Your Key', value: `\`${key}\``,    inline: false },
@@ -899,7 +919,7 @@ async function handleMessage(msg) {
         await discordRequest('POST', `/channels/${msg.channel_id}/messages`, {
             embeds: [{
                 title:  '🐕 Cerberus Bot Commands',
-                color:  0x00AF41,
+                color:  0x9B59B6,
                 fields: [
                     { name: '!addslot @user <duration>', value: 'Add a slot. e.g. `2h` `1d` `1w` `1m`',        inline: false },
                     { name: '!removeslot @user',         value: 'Remove a slot — kicks live session instantly', inline: false },
