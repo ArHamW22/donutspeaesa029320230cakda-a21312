@@ -250,6 +250,26 @@ function broadcast(obj, excludeWs = null) {
     }
 }
 
+// FIX: staggered broadcast so each pet in a batch arrives at the client
+// at least 150ms apart. The old code fired all broadcasts in a tight for-loop,
+// meaning all pets from the same server hit the client within ~1ms of each other.
+// Even with the name+job+gen dedup key fix on the client, sending them all
+// simultaneously increases the chance of race conditions and dropped rows.
+// 150ms stagger = 6-7 pets visible before the first one expires (60s window).
+function broadcastStaggered(pets, basePayload) {
+    pets.forEach((pet, i) => {
+        setTimeout(() => {
+            broadcast({
+                ...basePayload,
+                name:     pet.name,
+                gen:      pet.gen || '?',
+                mutation: pet.mutation || 'None',
+                value:    pet.value || 0,
+            });
+        }, i * 150);
+    });
+}
+
 // ─── WEBHOOK ─────────────────────────────────────
 function displayGen(gen) {
     if (!gen || gen === '?') return '?';
@@ -410,18 +430,22 @@ app.post('/submit_batch', async (req, res) => {
     const best    = pets[0];
     const bestGen = parseGen(best.gen);
 
-    for (const pet of pets) {
-        broadcast({
-            type:     'brainrot',
-            name:     pet.name,
-            gen:      pet.gen || '?',
-            mutation: pet.mutation || 'None',
-            value:    pet.value || 0,
-            job_id:   b.job_id || '',
-            place_id: b.place_id || '',
-        });
-    }
+    // FIX: use staggered broadcast instead of tight for-loop.
+    // Original: pets.forEach(pet => broadcast({...})) fired all at once.
+    // All messages arrived at the client within ~1ms, all sharing the same
+    // job_id. The client dedup (even with gen in the key) can still hit
+    // race conditions at that speed. 150ms between each pet is imperceptible
+    // to users and guarantees each one clears the dedup window cleanly.
+    broadcastStaggered(pets, {
+        type:     'brainrot',
+        job_id:   b.job_id || '',
+        place_id: b.place_id || '',
+    });
 
+    // Respond immediately — don't make scanner wait for staggered sends
+    res.json({ ok: true });
+
+    // Webhook fires async after response
     let webhook = null;
     if      (bestGen >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
     else if (bestGen >= 400e6) webhook = process.env.WEBHOOK_400_999M;
@@ -458,7 +482,6 @@ app.post('/submit_batch', async (req, res) => {
             timestamp:   new Date().toISOString(),
         });
     }
-    res.json({ ok: true });
 });
 
 // ── /submit (single pet) ─────────────────────────
