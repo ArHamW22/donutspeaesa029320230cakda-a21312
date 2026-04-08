@@ -77,6 +77,18 @@ if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
 
 app.get('/', (_req, res) => res.send('online'));
 
+// ─── GEN RATE PARSER ─────────────────────────────
+// Parses earn-rate strings like "$525M/s", "$1.2B/s", "$75K/s" → numeric value
+function parseGen(raw) {
+    if (!raw || raw === '?' || raw === '') return 0;
+    const s = String(raw).toLowerCase().replace(/[\$,\s%]/g, '').replace(/\/s$/, '');
+    const n = parseFloat(s.match(/-?\d+\.?\d*/)?.[0] || '0') || 0;
+    if (s.includes('b')) return n * 1e9;
+    if (s.includes('m')) return n * 1e6;
+    if (s.includes('k')) return n * 1e3;
+    return n;
+}
+
 // ─── LUARMOR — CACHED USER LIST ──────────────────
 let _usersCache   = null;
 let _usersCacheAt = 0;
@@ -185,8 +197,9 @@ function consumeToken(token) {
 }
 
 // ─── RATE LIMITING ───────────────────────────────
-// ✅ Rate limit per job+pet combo so ALL pets from a scan get through.
-//    Same pet from the same job is blocked for 30s to prevent spam.
+// Keyed by jobId|petName — blocks the SAME pet from the SAME server being
+// re-submitted within PET_COOLDOWN ms (prevents duplicate webhooks when a
+// bot re-executes on the same server). Different pets always get through.
 const petSubmitTimes = new Map();
 const globalSubmits  = [];
 const PET_COOLDOWN   = 30_000;
@@ -197,6 +210,7 @@ function isRateLimited(jobId, petName) {
     const now  = Date.now();
     const key  = jobId + '|' + (petName || '');
     const last = petSubmitTimes.get(key);
+    // Only block exact same pet from exact same server within cooldown
     if (last && now - last < PET_COOLDOWN) return true;
 
     const cutoff = now - GLOBAL_WINDOW;
@@ -239,14 +253,6 @@ function broadcast(obj, excludeWs = null) {
 }
 
 // ─── WEBHOOK ─────────────────────────────────────
-function formatPrice(v) {
-    const n = parseFloat(v) || 0;
-    if (n >= 1e9) return '$' + (n / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
-    if (n >= 1e6) return '$' + (n / 1e6).toFixed(1).replace(/\.?0+$/, '') + 'M';
-    if (n >= 1e3) return '$' + (n / 1e3).toFixed(1).replace(/\.?0+$/, '') + 'K';
-    return '$' + String(n);
-}
-
 function displayGen(gen) {
     if (!gen || gen === '?') return '?';
     return String(gen);
@@ -412,14 +418,17 @@ app.post('/submit_batch', (req, res) => {
         return res.status(400).json({ error: 'Missing pets array' });
     const jobId = b.job_id || 'unknown';
 
-    const pets    = [...b.pets].sort((a, bb) => (bb.value || 0) - (a.value || 0));
+    // ✅ FIX 1: Sort ALL pets by gen rate (earn rate) descending, not by price/value.
+    //    The "gen" field from the Lua script is the earn rate string e.g. "$525M/s".
+    const pets = [...b.pets].sort((a, bb) => parseGen(bb.gen) - parseGen(a.gen));
     const best    = pets[0];
-    const bestVal = parseFloat(String(best.value || 0));
+    const bestGen = parseGen(best.gen); // numeric gen rate for tier routing
 
-    // ✅ Filter out rate-limited pets individually
+    // ✅ FIX 2: Filter rate-limited pets (same pet, same server within 30s)
     const allowed = pets.filter(pet => !isRateLimited(jobId, pet.name));
     if (allowed.length === 0) return res.status(429).json({ error: 'Rate limited' });
 
+    // Broadcast ALL allowed pets to WebSocket clients
     for (const pet of allowed) {
         broadcast({
             type:     'brainrot',
@@ -432,21 +441,28 @@ app.post('/submit_batch', (req, res) => {
         });
     }
 
+    // ✅ FIX 3: Webhook tier routing uses gen rate, NOT price/value.
+    //    $50M/s–$400M/s → low tier, $400M/s–$999M/s → mid, $999M/s+ → peak
     let webhook = null;
-    if      (bestVal >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
-    else if (bestVal >= 400e6) webhook = process.env.WEBHOOK_400_999M;
-    else if (bestVal >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
+    if      (bestGen >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
+    else if (bestGen >= 400e6) webhook = process.env.WEBHOOK_400_999M;
+    else if (bestGen >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
 
-    console.log(`[Batch] ${allowed.length}/${pets.length} pets | best=${best.name} val=${bestVal} | webhook=${webhook ? 'yes' : 'no'}`);
+    console.log(`[Batch] ${allowed.length}/${pets.length} pets | best=${best.name} gen=${best.gen} (${bestGen}) | webhook=${webhook ? 'yes' : 'no'}`);
 
     if (webhook) {
         const bestMut = best.mutation && best.mutation !== 'None' ? best.mutation : 'Base';
-        const color   = bestVal >= 999e6 ? 0xFFD700 : bestVal >= 400e6 ? 0x00BFFF : 0x00AF41;
+        // ✅ FIX 4: Color tiers also based on gen rate
+        const color = bestGen >= 999e6 ? 0xFFD700 : bestGen >= 400e6 ? 0x00BFFF : 0x00AF41;
 
+        // ✅ FIX 5: Best line shows gen rate in brackets (not price)
         let desc = `🏆 **Best**\n[${bestMut}] ${best.name} [${displayGen(best.gen)}]`;
-        if (allowed.length > 1) {
+
+        // ✅ FIX 6: Show ALL allowed pets in "Others" (not just slice(1) of all pets)
+        const others = allowed.slice(1);
+        if (others.length > 0) {
             desc += '\n\n♦ **Others**';
-            for (const pet of allowed.slice(1)) {
+            for (const pet of others) {
                 const mut = pet.mutation && pet.mutation !== 'None' ? pet.mutation : 'Base';
                 desc += `\n• [${mut}] ${pet.name} [${displayGen(pet.gen)}]`;
             }
@@ -473,7 +489,6 @@ app.post('/submit', (req, res) => {
     if (!b?.name) return res.status(400).json({ error: 'Missing name' });
     const jobId = b.job_id || 'unknown';
 
-    // ✅ Rate limit per pet name so all pets from a scan get through
     if (isRateLimited(jobId, b.name)) return res.status(429).json({ error: 'Rate limited' });
 
     broadcast({
@@ -482,20 +497,21 @@ app.post('/submit', (req, res) => {
         value: b.value || 0, job_id: b.job_id || '', place_id: b.place_id || '',
     });
 
-    const val = parseFloat(String(b.value || 0));
+    // ✅ FIX: Single submit also routes by gen rate, not price
+    const genVal = parseGen(b.gen);
     let webhook = null;
-    if      (val >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
-    else if (val >= 400e6) webhook = process.env.WEBHOOK_400_999M;
-    else if (val >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
+    if      (genVal >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
+    else if (genVal >= 400e6) webhook = process.env.WEBHOOK_400_999M;
+    else if (genVal >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
 
-    console.log(`[Submit] ${b.name} | gen=${b.gen} | val=${val} | webhook=${webhook ? 'yes' : 'no'}`);
+    console.log(`[Submit] ${b.name} | gen=${b.gen} (${genVal}) | webhook=${webhook ? 'yes' : 'no'}`);
 
     if (webhook) {
         const mut = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
         fireWebhook(webhook, {
             title:       '⭐ Cerberus Notifier | Find',
             description: `🏆 **Best**\n[${mut}] ${b.name} [${displayGen(b.gen)}]\n\n💸 **Buy a Slot!**`,
-            color:       val >= 999e6 ? 0xFFD700 : val >= 400e6 ? 0x00BFFF : 0x00AF41,
+            color:       genVal >= 999e6 ? 0xFFD700 : genVal >= 400e6 ? 0x00BFFF : 0x00AF41,
             thumbnail:   b.image_url ? { url: b.image_url } : undefined,
             fields:      [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
             footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
