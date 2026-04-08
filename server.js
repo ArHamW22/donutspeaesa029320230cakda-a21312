@@ -185,24 +185,30 @@ function consumeToken(token) {
 }
 
 // ─── RATE LIMITING ───────────────────────────────
-const jobSubmitTimes = new Map();
+// ✅ Rate limit per job+pet combo so ALL pets from a scan get through.
+//    Same pet from the same job is blocked for 30s to prevent spam.
+const petSubmitTimes = new Map();
 const globalSubmits  = [];
-const JOB_COOLDOWN   = 30_000;
-const GLOBAL_MAX     = 60;
+const PET_COOLDOWN   = 30_000;
+const GLOBAL_MAX     = 200;
 const GLOBAL_WINDOW  = 3_600_000;
 
-function isRateLimited(jobId) {
-    const now     = Date.now();
-    const lastJob = jobSubmitTimes.get(jobId);
-    if (lastJob && now - lastJob < JOB_COOLDOWN) return true;
+function isRateLimited(jobId, petName) {
+    const now  = Date.now();
+    const key  = jobId + '|' + (petName || '');
+    const last = petSubmitTimes.get(key);
+    if (last && now - last < PET_COOLDOWN) return true;
+
     const cutoff = now - GLOBAL_WINDOW;
     while (globalSubmits.length && globalSubmits[0] < cutoff) globalSubmits.shift();
     if (globalSubmits.length >= GLOBAL_MAX) return true;
-    jobSubmitTimes.set(jobId, now);
+
+    petSubmitTimes.set(key, now);
     globalSubmits.push(now);
-    if (jobSubmitTimes.size > 1000) {
-        for (const [jid, t] of jobSubmitTimes) {
-            if (now - t > JOB_COOLDOWN * 2) jobSubmitTimes.delete(jid);
+
+    if (petSubmitTimes.size > 5000) {
+        for (const [k, t] of petSubmitTimes) {
+            if (now - t > PET_COOLDOWN * 2) petSubmitTimes.delete(k);
         }
     }
     return false;
@@ -233,8 +239,6 @@ function broadcast(obj, excludeWs = null) {
 }
 
 // ─── WEBHOOK ─────────────────────────────────────
-
-// Format a numeric price value for display e.g. 10000000000 -> "$10B"
 function formatPrice(v) {
     const n = parseFloat(v) || 0;
     if (n >= 1e9) return '$' + (n / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
@@ -243,8 +247,6 @@ function formatPrice(v) {
     return '$' + String(n);
 }
 
-// The earn rate (gen field) comes in already formatted as a string
-// e.g. "$525M/s" — just use it directly, no reformatting needed.
 function displayGen(gen) {
     if (!gen || gen === '?') return '?';
     return String(gen);
@@ -403,31 +405,26 @@ app.post('/log_execute', async (req, res) => {
 });
 
 // ── /submit_batch ─────────────────────────────────
-// pet fields from Lua:
-//   name     = pet name
-//   gen      = earn rate string e.g. "$525M/s"  ← shown in Discord
-//   mutation = mutation name
-//   value    = numeric price (used for sorting + webhook tier)
-//   rarity   = rarity tier string
 app.post('/submit_batch', (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const b = req.body;
     if (!b?.pets || !Array.isArray(b.pets) || b.pets.length === 0)
         return res.status(400).json({ error: 'Missing pets array' });
     const jobId = b.job_id || 'unknown';
-    if (isRateLimited(jobId)) return res.status(429).json({ error: 'Rate limited' });
 
-    // Sort by numeric price value descending
     const pets    = [...b.pets].sort((a, bb) => (bb.value || 0) - (a.value || 0));
     const best    = pets[0];
     const bestVal = parseFloat(String(best.value || 0));
 
-    // Broadcast to GUI clients
-    for (const pet of pets) {
+    // ✅ Filter out rate-limited pets individually
+    const allowed = pets.filter(pet => !isRateLimited(jobId, pet.name));
+    if (allowed.length === 0) return res.status(429).json({ error: 'Rate limited' });
+
+    for (const pet of allowed) {
         broadcast({
             type:     'brainrot',
             name:     pet.name,
-            gen:      pet.gen || '?',       // earn rate string
+            gen:      pet.gen || '?',
             mutation: pet.mutation || 'None',
             value:    pet.value || 0,
             job_id:   b.job_id || '',
@@ -435,25 +432,21 @@ app.post('/submit_batch', (req, res) => {
         });
     }
 
-    // Pick webhook tier based on numeric price
     let webhook = null;
     if      (bestVal >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
     else if (bestVal >= 400e6) webhook = process.env.WEBHOOK_400_999M;
     else if (bestVal >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
 
-    console.log(`[Batch] ${pets.length} pets | best=${best.name} val=${bestVal} | webhook=${webhook ? 'yes' : 'no'}`);
+    console.log(`[Batch] ${allowed.length}/${pets.length} pets | best=${best.name} val=${bestVal} | webhook=${webhook ? 'yes' : 'no'}`);
 
     if (webhook) {
         const bestMut = best.mutation && best.mutation !== 'None' ? best.mutation : 'Base';
         const color   = bestVal >= 999e6 ? 0xFFD700 : bestVal >= 400e6 ? 0x00BFFF : 0x00AF41;
 
-        // FIX: show earn rate (gen) in Discord, not the reformatted numeric price.
-        // gen is already a formatted string like "$525M/s" — display it directly.
         let desc = `🏆 **Best**\n[${bestMut}] ${best.name} [${displayGen(best.gen)}]`;
-
-        if (pets.length > 1) {
+        if (allowed.length > 1) {
             desc += '\n\n♦ **Others**';
-            for (const pet of pets.slice(1)) {
+            for (const pet of allowed.slice(1)) {
                 const mut = pet.mutation && pet.mutation !== 'None' ? pet.mutation : 'Base';
                 desc += `\n• [${mut}] ${pet.name} [${displayGen(pet.gen)}]`;
             }
@@ -473,13 +466,15 @@ app.post('/submit_batch', (req, res) => {
     res.json({ ok: true });
 });
 
-// ── /submit (single pet, legacy) ─────────────────
+// ── /submit (single pet) ─────────────────────────
 app.post('/submit', (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const b = req.body;
     if (!b?.name) return res.status(400).json({ error: 'Missing name' });
     const jobId = b.job_id || 'unknown';
-    if (isRateLimited(jobId)) return res.status(429).json({ error: 'Rate limited' });
+
+    // ✅ Rate limit per pet name so all pets from a scan get through
+    if (isRateLimited(jobId, b.name)) return res.status(429).json({ error: 'Rate limited' });
 
     broadcast({
         type: 'brainrot', name: b.name,
@@ -493,9 +488,10 @@ app.post('/submit', (req, res) => {
     else if (val >= 400e6) webhook = process.env.WEBHOOK_400_999M;
     else if (val >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
 
+    console.log(`[Submit] ${b.name} | gen=${b.gen} | val=${val} | webhook=${webhook ? 'yes' : 'no'}`);
+
     if (webhook) {
         const mut = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
-        // FIX: same as batch — show gen string directly, not reformatted value
         fireWebhook(webhook, {
             title:       '⭐ Cerberus Notifier | Find',
             description: `🏆 **Best**\n[${mut}] ${b.name} [${displayGen(b.gen)}]\n\n💸 **Buy a Slot!**`,
