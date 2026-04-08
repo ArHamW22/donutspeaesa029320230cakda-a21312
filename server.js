@@ -59,17 +59,6 @@ const MAX_SLOTS  = 7;
 const LOGO_URL   = 'https://media.discordapp.net/attachments/1487763701040680971/1489669239202644089/image.png';
 const ADMIN_IDS  = new Set(['1405960794503647324']);
 
-console.log('[ENV] API_KEY set:',    !!API_KEY);
-console.log('[ENV] LRM_KEY set:',    !!LRM_KEY);
-console.log('[ENV] LRM_PID:',         LRM_PID);
-console.log('[ENV] BOT_TOKEN set:',  !!BOT_TOKEN);
-console.log('[ENV] CHANNEL_ID:',      CHANNEL_ID);
-console.log('[ENV] FETCHER_URL:',     FETCHER_URL);
-if (!process.env.WEBHOOK_50_400M)    console.warn('[ENV] WARNING: WEBHOOK_50_400M not set');
-if (!process.env.WEBHOOK_400_999M)   console.warn('[ENV] WARNING: WEBHOOK_400_999M not set');
-if (!process.env.WEBHOOK_999M_PLUS)  console.warn('[ENV] WARNING: WEBHOOK_999M_PLUS not set');
-if (!process.env.WEBHOOK_EXECUTIONS) console.warn('[ENV] WARNING: WEBHOOK_EXECUTIONS not set');
-
 if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
     console.error('[ENV] Missing required env vars — exiting');
     process.exit(1);
@@ -88,7 +77,7 @@ function parseGen(raw) {
     return n;
 }
 
-// ─── WIKI IMAGE FETCH (server-side fallback) ──────
+// ─── WIKI IMAGE FETCH ────────────────────────────
 async function fetchWikiImage(petName) {
     try {
         const encoded = encodeURIComponent(petName.replace(/ /g, '_'));
@@ -101,7 +90,7 @@ async function fetchWikiImage(petName) {
             }
         }
     } catch (e) {
-        console.warn('[Wiki] Image fetch failed:', e.message);
+        // silent
     }
     return null;
 }
@@ -124,7 +113,6 @@ async function getAllUsers(forceRefresh = false) {
         _usersCacheAt = now;
         return _usersCache;
     } catch (e) {
-        console.error('[Luarmor] getAllUsers error:', e.message);
         return _usersCache || [];
     }
 }
@@ -164,12 +152,11 @@ async function createKey(durationSeconds, discordId, label) {
         const text = await res.text();
         let d;
         try { d = JSON.parse(text); }
-        catch { console.error('[Luarmor] createKey non-JSON:', text.slice(0, 200)); return null; }
-        if (!d.success) { console.error('[Luarmor] createKey failed:', JSON.stringify(d)); return null; }
+        catch { return null; }
+        if (!d.success) { return null; }
         invalidateUsersCache();
         return d.user_key;
     } catch (e) {
-        console.error('[Luarmor] createKey error:', e.message);
         return null;
     }
 }
@@ -183,7 +170,6 @@ async function revokeKey(userKey) {
         if (res.ok) invalidateUsersCache();
         return res.ok;
     } catch (e) {
-        console.error('[Luarmor] revokeKey error:', e.message);
         return false;
     }
 }
@@ -275,7 +261,7 @@ function fireWebhook(webhook, embedData) {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ embeds: [embedData] }),
-    }).catch(e => console.warn('[Webhook] Failed:', e.message));
+    }).catch(() => {});
 }
 
 // ══════════════════════════════════════════════════
@@ -289,7 +275,6 @@ function botJoin(userKey, jobId) {
     botCurrent.set(userKey, jobId);
     if (!botJobMap.has(jobId)) botJobMap.set(jobId, new Set());
     botJobMap.get(jobId).add(userKey);
-    console.log(`[BotTrack] ${userKey.slice(0,8)}… joined ${jobId} | occupied: ${botJobMap.size} servers`);
 }
 
 function botLeave(userKey) {
@@ -309,29 +294,21 @@ function isJobOccupied(jobId) {
 }
 
 async function getNextServerFromFetcher(requestingUserKey) {
-    const skipped = [];
     for (let i = 0; i < 10; i++) {
         let data;
         try {
             const res = await axios.get(`${FETCHER_URL}/next_server`, { timeout: 8_000 });
             data = res.data;
-        } catch (e) {
-            console.warn('[Fetcher proxy] Error:', e.message);
+        } catch {
             return null;
         }
         if (!data || data.error || !data.job_id) return null;
         const jobId = data.job_id;
-        if (!isJobOccupied(jobId)) {
-            console.log(`[Fetcher proxy] Giving ${jobId} to ${requestingUserKey.slice(0,8)}… (skipped ${skipped.length})`);
-            return jobId;
-        }
-        console.log(`[Fetcher proxy] ${jobId} occupied — skipping`);
-        skipped.push(jobId);
+        if (!isJobOccupied(jobId)) return jobId;
         try {
             await axios.post(`${FETCHER_URL}/visited`, { job_id: jobId }, { timeout: 4_000 });
         } catch {}
     }
-    console.warn('[Fetcher proxy] Could not find unoccupied server after 10 attempts');
     return null;
 }
 
@@ -344,7 +321,6 @@ app.post('/scan_done', (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const { job_id, found_count, players } = req.body || {};
     if (!job_id) return res.status(400).json({ error: 'Missing job_id' });
-    console.log(`[Scan] job=${job_id} found=${found_count ?? 0} players=${players ?? '?'}`);
     broadcast({ type: 'scan_result', job_id, found_count: found_count ?? 0, players: players ?? 0 });
     hopApproved.add(job_id);
     setTimeout(() => hopApproved.delete(job_id), 300_000);
@@ -393,7 +369,6 @@ app.get('/get_token', async (req, res) => {
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
     const { valid, user } = await isKeyValid(userKey);
     if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
-    console.log('[Token] Issued for key:', userKey.slice(0, 8) + '…');
     res.json({ token: generateToken(userKey, user) });
 });
 
@@ -406,7 +381,6 @@ app.post('/log_execute', async (req, res) => {
     if (!username) return res.status(400).json({ error: 'Missing username' });
     const discordId  = user?.discord_id || null;
     const discordTag = discordId ? `<@${discordId}>` : 'Unknown';
-    console.log(`[Execute] ${username} (${userId}) — Discord: ${discordId || 'unknown'}`);
     const webhook = process.env.WEBHOOK_EXECUTIONS;
     if (webhook) {
         fireWebhook(webhook, {
@@ -430,16 +404,11 @@ app.post('/submit_batch', async (req, res) => {
         return res.status(400).json({ error: 'Missing pets array' });
     const jobId = b.job_id || 'unknown';
 
-    if (isServerRateLimited(jobId)) {
-        console.log(`[Batch] Rate limited server: ${jobId}`);
-        return res.status(429).json({ error: 'Rate limited' });
-    }
+    if (isServerRateLimited(jobId)) return res.status(429).json({ error: 'Rate limited' });
 
     const pets    = [...b.pets].sort((a, bb) => parseGen(bb.gen) - parseGen(a.gen));
     const best    = pets[0];
     const bestGen = parseGen(best.gen);
-
-    console.log(`[Batch] ${pets.length} pets | best=${best.name} gen=${best.gen} (${bestGen})`);
 
     for (const pet of pets) {
         broadcast({
@@ -458,23 +427,16 @@ app.post('/submit_batch', async (req, res) => {
     else if (bestGen >= 400e6) webhook = process.env.WEBHOOK_400_999M;
     else if (bestGen >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
 
-    console.log(`[Batch] webhook tier: ${webhook ? 'yes' : 'no (below 50M)'}`);
-
     if (webhook) {
-        // Use client image, fall back to server-side wiki fetch
         let imageUrl = b.image_url || null;
-        console.log(`[Batch] client image_url: ${imageUrl}`);
         if (!imageUrl) {
-            console.log(`[Batch] Fetching wiki image for: ${best.name}`);
             for (const pet of pets) {
                 imageUrl = await fetchWikiImage(pet.name);
                 if (imageUrl) break;
             }
         }
-        console.log(`[Batch] final image_url: ${imageUrl}`);
 
         const bestMut = best.mutation && best.mutation !== 'None' ? best.mutation : 'Base';
-
         let desc = `🏆 **Best**\n[${bestMut}] ${best.name} [${displayGen(best.gen)}]`;
         const others = pets.slice(1);
         if (others.length > 0) {
@@ -520,12 +482,9 @@ app.post('/submit', async (req, res) => {
     else if (genVal >= 400e6) webhook = process.env.WEBHOOK_400_999M;
     else if (genVal >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
 
-    console.log(`[Submit] ${b.name} | gen=${b.gen} (${genVal}) | webhook=${webhook ? 'yes' : 'no'}`);
-
     if (webhook) {
         let imageUrl = b.image_url || null;
         if (!imageUrl) imageUrl = await fetchWikiImage(b.name);
-        console.log(`[Submit] image_url: ${imageUrl}`);
 
         const mut = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
         fireWebhook(webhook, {
@@ -581,16 +540,11 @@ wss.on('connection', async (ws, req) => {
     ws._authExpire  = user ? user.auth_expire : null;
     ws.isAlive      = true;
 
-    console.log('[WS] Connected:', userKey.slice(0, 8) + '…');
-
     let expiryTimer = null;
     if (user && user.auth_expire !== -1) {
         const secsLeft = user.auth_expire - Math.floor(Date.now() / 1000);
         if (secsLeft > 0) {
-            expiryTimer = setTimeout(() => {
-                console.log('[WS] Key expired, kicking:', userKey.slice(0, 8) + '…');
-                wsKick(ws);
-            }, secsLeft * 1000);
+            expiryTimer = setTimeout(() => { wsKick(ws); }, secsLeft * 1000);
         } else {
             wsKick(ws);
             return;
@@ -601,7 +555,7 @@ wss.on('connection', async (ws, req) => {
     let _jobId    = null;
 
     ws.on('pong', () => { ws.isAlive = true; });
-    ws.on('error', err => console.warn('[WS] Socket error:', err.message));
+    ws.on('error', () => {});
 
     ws.on('message', data => {
         let msg;
@@ -654,7 +608,6 @@ setInterval(() => {
     for (const ws of wss.clients) {
         if (ws.readyState !== WebSocket.OPEN) continue;
         if (ws._authExpire !== -1 && ws._authExpire && ws._authExpire <= now) {
-            console.log('[Watcher] In-memory expiry kick:', ws._cerberusKey?.slice(0, 8) + '…');
             wsKick(ws);
         }
     }
@@ -669,10 +622,7 @@ setInterval(async () => {
         if (ws.readyState !== WebSocket.OPEN || !ws._cerberusKey) continue;
         const u     = userMap.get(ws._cerberusKey);
         const valid = u && !u.banned && (u.auth_expire === -1 || u.auth_expire > now);
-        if (!valid) {
-            console.log('[Watcher] Luarmor kick:', ws._cerberusKey?.slice(0, 8) + '…');
-            wsKick(ws);
-        }
+        if (!valid) wsKick(ws);
         if (u) ws._authExpire = u.auth_expire;
     }
 }, 60_000);
@@ -698,7 +648,6 @@ function kickLiveSockets(userKey) {
 }
 
 async function rescheduleExpiryTimers() {
-    console.log('[Startup] Re-scheduling expiry timers…');
     const now   = Math.floor(Date.now() / 1000);
     const users = await getAllUsers(true);
     let   count = 0;
@@ -708,13 +657,12 @@ async function rescheduleExpiryTimers() {
         const secsLeft = u.auth_expire - now;
         if (secsLeft <= 0) continue;
         setTimeout(() => {
-            console.log('[Expiry] Startup timer fired:', u.user_key?.slice(0, 8) + '…');
             kickLiveSockets(u.user_key);
             schedulePanel(500);
         }, secsLeft * 1000);
         count++;
     }
-    console.log(`[Startup] Scheduled ${count} expiry timer(s)`);
+    console.log(`[Cerberus] ${count} expiry timer(s) scheduled`);
 }
 
 // ══════════════════════════════════════════════════
@@ -755,14 +703,9 @@ async function discordRequest(method, path, body) {
             headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' },
             body: body ? JSON.stringify(body) : undefined,
         });
-        if (!res.ok) {
-            const t = await res.text();
-            console.warn(`[Discord] ${method} ${path} failed:`, t.slice(0, 200));
-            return null;
-        }
+        if (!res.ok) return null;
         return res.json();
-    } catch (e) {
-        console.warn(`[Discord] ${method} ${path} threw:`, e.message);
+    } catch {
         return null;
     }
 }
@@ -800,15 +743,13 @@ async function updatePanel() {
     };
     if (!panelMessageId) {
         const msg = await discordRequest('POST', `/channels/${CHANNEL_ID}/messages`, { embeds: [embed] });
-        if (msg) { panelMessageId = msg.id; console.log('[Panel] Posted:', panelMessageId); }
+        if (msg) panelMessageId = msg.id;
     } else {
         const result = await discordRequest('PATCH', `/channels/${CHANNEL_ID}/messages/${panelMessageId}`, { embeds: [embed] });
         if (!result) {
             panelMessageId = null;
             const msg = await discordRequest('POST', `/channels/${CHANNEL_ID}/messages`, { embeds: [embed] });
-            if (msg) { panelMessageId = msg.id; console.log('[Panel] Re-posted:', panelMessageId); }
-        } else {
-            console.log('[Panel] Updated at', new Date().toLocaleTimeString());
+            if (msg) panelMessageId = msg.id;
         }
     }
 }
@@ -855,7 +796,6 @@ async function handleMessage(msg) {
             });
         }
         setTimeout(() => {
-            console.log('[Expiry] Timer fired for key:', key.slice(0, 8) + '…');
             kickLiveSockets(key);
             schedulePanel(500);
         }, duration.seconds * 1000);
@@ -932,7 +872,7 @@ async function handleMessage(msg) {
 
 function startGateway() {
     gatewayWs = new WebSocket('wss://gateway.discord.gg/?v=10&encoding=json');
-    gatewayWs.on('open', () => console.log('[Gateway] Connected'));
+    gatewayWs.on('open', () => {});
     gatewayWs.on('message', async data => {
         let payload;
         try { payload = JSON.parse(data); } catch { return; }
@@ -952,7 +892,7 @@ function startGateway() {
             }));
         }
         if (op === 0 && t === 'READY') {
-            console.log('[Gateway] Bot ready:', d.user.username);
+            console.log(`[Cerberus] Bot online: ${d.user.username}`);
             await rescheduleExpiryTimers();
             updatePanel();
         }
@@ -961,11 +901,10 @@ function startGateway() {
         }
     });
     gatewayWs.on('close', code => {
-        console.warn('[Gateway] Closed:', code, '— reconnecting in 5s');
         clearInterval(heartbeatGW);
         setTimeout(startGateway, 5000);
     });
-    gatewayWs.on('error', err => console.error('[Gateway] Error:', err.message));
+    gatewayWs.on('error', () => {});
 }
 
 startGateway();
