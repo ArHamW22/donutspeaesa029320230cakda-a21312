@@ -237,15 +237,15 @@ function wsKick(ws) {
     setTimeout(() => { try { ws.terminate(); } catch {} }, 300);
 }
 
-const PING_BUF    = Buffer.from(JSON.stringify({ type: 'ping' }));
-const EXPIRED_BUF = Buffer.from(JSON.stringify({ type: 'expired' }));
+const PING_STR    = JSON.stringify({ type: 'ping' });
+const EXPIRED_STR = JSON.stringify({ type: 'expired' });
 
 function broadcast(obj, excludeWs = null) {
-    const buf = Buffer.from(JSON.stringify(obj));
+    const str = JSON.stringify(obj);
     for (const client of wss.clients) {
         if (client === excludeWs) continue;
         if (client.readyState === WebSocket.OPEN) {
-            try { client.send(buf); } catch {}
+            try { client.send(str); } catch {}
         }
     }
 }
@@ -530,7 +530,7 @@ wss.on('connection', async (ws, req) => {
 
     const entry = consumeToken(token);
     if (!entry) {
-        try { ws.send(EXPIRED_BUF); } catch {}
+        try { ws.send(EXPIRED_STR); } catch {}
         ws.terminate();
         return;
     }
@@ -631,7 +631,7 @@ setInterval(async () => {
 setInterval(() => {
     for (const client of wss.clients) {
         if (client.readyState === WebSocket.OPEN) {
-            try { client.send(PING_BUF); } catch {}
+            try { client.send(PING_STR); } catch {}
         }
     }
 }, 20_000);
