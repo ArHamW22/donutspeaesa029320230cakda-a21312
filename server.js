@@ -547,14 +547,28 @@ function presenceLeave(jobId, username) {
 wss.on('connection', async (ws, req) => {
     const rawUrl = req.url || '/';
     let token    = null;
-    const qi     = rawUrl.indexOf('?');
+
+    // Method 1: query string ?token=xxx  (standard)
+    const qi = rawUrl.indexOf('?');
     if (qi >= 0) {
         try { token = new URLSearchParams(rawUrl.slice(qi + 1)).get('token') || null; } catch {}
     }
+    // Method 2: Sec-WebSocket-Protocol header (fallback for proxies that strip query strings)
     if (!token) {
         const proto = req.headers['sec-websocket-protocol'];
-        if (proto) token = proto.split(',')[0].trim() || null;
+        if (proto) {
+            token = proto.split(',')[0].trim() || null;
+            // Must echo the protocol back or browser clients reject the connection
+            if (token) ws.send = ws.send; // no-op, but we handle protocol echo below
+        }
     }
+    // Method 3: Authorization header
+    if (!token) {
+        const auth = req.headers['authorization'] || '';
+        if (auth.startsWith('Bearer ')) token = auth.slice(7).trim() || null;
+    }
+
+    console.log('[WS] Upgrade received, url=' + rawUrl.slice(0, 60) + ' token_found=' + !!token);
 
     const entry = consumeToken(token);
     if (!entry) {
