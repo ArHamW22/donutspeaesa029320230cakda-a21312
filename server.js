@@ -1,19 +1,11 @@
 // ══════════════════════════════════════════════════
-//  CERBERUS — server.js  (reliability build)
+//  CERBERUS — server.js  (reliability build v2)
 //
 //  FIXES vs previous build:
-//  1. isKeyValid: treats auth_expire==0 as unactivated (valid),
-//     not expired. Retries up to 3x with backoff on network fail.
-//  2. Long-session protection: 60s re-validation now uses a
-//     per-socket grace counter — Luarmor network hiccup will NOT
-//     kick a user (must fail 3 consecutive checks).
-//  3. getAllUsers cache TTL raised to 45s; force-refresh only when
-//     we actually need fresh data (key create/revoke/expiry check).
-//  4. /get_token endpoint: retries isKeyValid up to 3x before 403.
-//  5. Token TTL raised to 10 min so reconnects within a session
-//     always succeed even if the WS drops briefly.
-//  6. Stale token cleanup on duplicate key login is preserved.
-//  7. All setInterval checks guard against Luarmor being down.
+//  1. !addslot: passes key_days to Luarmor instead of auth_expire
+//     (works for both key_days and auth_expire project types).
+//  2. Webhook embeds: cleaner KaWaifu-style layout, removed
+//     "Buy a Slot!" line, purple accent, image thumbnail.
 // ══════════════════════════════════════════════════
 'use strict';
 
@@ -118,7 +110,6 @@ async function fetchWikiImage(petName) {
 }
 
 // ─── USER CACHE ──────────────────────────────────
-// TTL raised to 45s. Force-refresh only on mutations.
 let _usersCache   = null;
 let _usersCacheAt = 0;
 const USERS_TTL   = 45_000;
@@ -131,8 +122,6 @@ async function getAllUsers(forceRefresh = false) {
             headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' },
         });
         if (!res.ok) {
-            // Network hiccup — return stale cache rather than empty array
-            // so long-running sessions are NOT kicked by a transient Luarmor outage
             console.warn('[Luarmor] getAllUsers failed status=' + res.status + ' — returning stale cache');
             return _usersCache || [];
         }
@@ -152,10 +141,6 @@ function invalidateUsersCache() {
 }
 
 // ─── KEY VALIDATION ──────────────────────────────
-// FIX 1: auth_expire === 0 means "unactivated / key_days not yet
-//         started" — treat as valid (Luarmor sets 0 before HWID link).
-// FIX 2: retry up to 3 times with 800ms back-off on network errors
-//         or empty responses so freshly-redeemed keys always work.
 async function isKeyValid(key, maxRetries = 3) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
@@ -163,40 +148,27 @@ async function isKeyValid(key, maxRetries = 3) {
                 `https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(key)}`,
                 { headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' } },
             );
-
-            // HTTP-level failure — retry unless it's a hard 401/403
             if (!res.ok) {
                 if (res.status === 401 || res.status === 403) return { valid: false, user: null, reason: 'unauthorized' };
                 if (attempt < maxRetries) { await sleep(800 * attempt); continue; }
                 return { valid: false, user: null, reason: 'http_' + res.status };
             }
-
             const d = await res.json();
-
-            // Empty users array — key may be freshly redeemed and not yet indexed
             if (!d.success || !Array.isArray(d.users) || d.users.length === 0) {
                 if (attempt < maxRetries) {
-                    console.log(`[Luarmor] isKeyValid: empty result for ${key.slice(0,8)}… attempt ${attempt}/${maxRetries}, retrying`);
+                    console.log(`[Luarmor] isKeyValid: empty result attempt ${attempt}/${maxRetries}, retrying`);
                     await sleep(800 * attempt);
                     continue;
                 }
                 return { valid: false, user: null, reason: 'not_found' };
             }
-
             const u   = d.users[0];
             const now = Math.floor(Date.now() / 1000);
-
             if (u.banned) return { valid: false, user: u, reason: 'banned' };
-
-            // auth_expire === 0  → key generated with key_days, not yet activated → valid
-            // auth_expire === -1 → lifetime key → valid
-            // auth_expire > now  → not yet expired → valid
             if (u.auth_expire !== -1 && u.auth_expire !== 0 && u.auth_expire <= now) {
                 return { valid: false, user: u, reason: 'expired' };
             }
-
             return { valid: true, user: u };
-
         } catch (err) {
             if (attempt < maxRetries) {
                 console.warn(`[Luarmor] isKeyValid threw attempt ${attempt}:`, err.message);
@@ -211,21 +183,41 @@ async function isKeyValid(key, maxRetries = 3) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ─── FIX 3: createKey now sends key_days instead of auth_expire ──
+// Luarmor's POST /users API expects key_days (integer number of days)
+// for key_days-typed projects. auth_expire (unix ts) is for
+// auth_expire-typed projects. We send BOTH so it works either way.
 async function createKey(durationSeconds, discordId, label) {
     const auth_expire = Math.floor(Date.now() / 1000) + durationSeconds;
+    // key_days: round up to nearest day (minimum 1)
+    const key_days = Math.max(1, Math.ceil(durationSeconds / 86400));
+
     try {
         const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
             method:  'POST',
             headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' },
-            body:    JSON.stringify({ auth_expire, discord_id: discordId, note: `Cerberus — ${label}` }),
+            body:    JSON.stringify({
+                auth_expire,
+                key_days,
+                discord_id: discordId,
+                note: `Cerberus — ${label}`,
+            }),
         });
         const text = await res.text();
+
+        // Log the raw Luarmor response so you can debug if it fails again
+        console.log('[createKey] Luarmor status=' + res.status + ' body=' + text.slice(0, 300));
+
         let d;
         try { d = JSON.parse(text); } catch { return null; }
-        if (!d.success) return null;
+        if (!d.success) {
+            console.warn('[createKey] Luarmor returned success=false:', d);
+            return null;
+        }
         invalidateUsersCache();
         return d.user_key;
-    } catch {
+    } catch (err) {
+        console.error('[createKey] threw:', err.message);
         return null;
     }
 }
@@ -249,14 +241,10 @@ async function getKeyByDiscordId(discordId) {
 }
 
 // ─── TOKEN SYSTEM ────────────────────────────────
-// FIX 5: TTL raised to 10 min so if WS drops and Lua retries
-// connect() within the reconnect window, getToken() succeeds
-// without a second Luarmor API hit.
 const TOKEN_TTL = 10 * 60 * 1000;
 const tokens    = new Map();
 
 function generateToken(userKey, user) {
-    // Remove any existing token for this key so there's no stale duplicate
     for (const [tok, entry] of tokens) {
         if (entry.userKey === userKey) tokens.delete(tok);
     }
@@ -275,8 +263,6 @@ function consumeToken(token) {
         tokens.delete(token);
         return { notFound: true };
     }
-    // Do NOT delete on consume — allow reuse within TTL window
-    // This lets the Lua client reconnect without fetching a new token
     return entry;
 }
 
@@ -339,7 +325,6 @@ function broadcastStaggered(pets, basePayload) {
                 ...basePayload,
                 name:     pet.name,
                 gen:      pet.gen || '?',
-                // Pass actual mutation — empty string and 'None' both normalize to 'None'
                 mutation: (pet.mutation && pet.mutation !== '' && pet.mutation !== 'None') ? pet.mutation : 'None',
                 value:    pet.value || 0,
             });
@@ -358,6 +343,48 @@ function fireWebhook(webhook, embedData) {
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ embeds: [embedData] }),
     }).catch(() => {});
+}
+
+// ─── FIX 4: Clean embed builder ──────────────────
+// Styled to match the KaWaifu reference screenshot:
+// - Bold "Best" line with mutation tag
+// - Clean bullet list for others
+// - No "Buy a Slot!" text
+// - Purple theme, thumbnail, clean footer
+function buildEmbed(tierName, pets, jobInfo) {
+    const best    = pets[0];
+    const bestMut = (best.mutation && best.mutation !== 'None' && best.mutation !== '') ? best.mutation : 'Base';
+
+    // Tier emoji
+    const tierEmoji = tierName === 'Peaklights' ? '🏆' : tierName === 'Highlights' ? '⭐' : '💠';
+
+    // Best line
+    let description = `🥇 **Best**\n\`${bestMut}\` ${best.name} [**${displayGen(best.gen)}**]`;
+
+    // Others
+    if (pets.length > 1) {
+        description += '\n\n🔹 **Others**';
+        for (const pet of pets.slice(1)) {
+            const mut = (pet.mutation && pet.mutation !== 'None' && pet.mutation !== '') ? pet.mutation : 'Base';
+            description += `\n• \`${mut}\` ${pet.name} [${displayGen(pet.gen)}]`;
+        }
+    }
+
+    return {
+        title:       `${tierEmoji} Cerberus Notifier | ${tierName}`,
+        description: description.slice(0, 3900),
+        color:       0x9B59B6,
+        thumbnail:   jobInfo.imageUrl ? { url: jobInfo.imageUrl } : undefined,
+        fields: [
+            {
+                name:   '👥 Players',
+                value:  jobInfo.players ? `${jobInfo.players}/8` : 'Unknown',
+                inline: true,
+            },
+        ],
+        footer:    { text: 'Cerberus Notifier • gg/cerberusnotifier', icon_url: LOGO_URL },
+        timestamp: new Date().toISOString(),
+    };
 }
 
 // ─── BOT TRACKING ────────────────────────────────
@@ -446,18 +473,14 @@ app.post('/bot_leave', (req, res) => {
 });
 
 // ─── ROUTES ──────────────────────────────────────
-// FIX 4: /get_token retries isKeyValid before giving up.
-// This is the critical path for first-time users.
 app.get('/get_token', async (req, res) => {
     const userKey = (req.query.user_key || '').trim();
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
-
-    const { valid, user, reason } = await isKeyValid(userKey, 3); // already retries internally
+    const { valid, user, reason } = await isKeyValid(userKey, 3);
     if (!valid) {
         console.log(`[Token] Rejected key ${userKey.slice(0,8)}… reason=${reason}`);
         return res.status(403).json({ error: 'Invalid or expired key', reason });
     }
-
     console.log('[Token] Issued for:', userKey.slice(0, 8) + '…');
     res.json({ token: generateToken(userKey, user) });
 });
@@ -499,7 +522,7 @@ app.post('/submit_batch', async (req, res) => {
     broadcastStaggered(pets, { type:'brainrot', job_id:b.job_id||'', place_id:b.place_id||'' });
     res.json({ ok: true });
 
-    let webhook = null;
+    let webhook  = null;
     let tierName = null;
     if      (bestGen >= 999e6) { webhook = process.env.WEBHOOK_999M_PLUS; tierName = 'Peaklights'; }
     else if (bestGen >= 400e6) { webhook = process.env.WEBHOOK_400_999M;  tierName = 'Highlights'; }
@@ -508,29 +531,8 @@ app.post('/submit_batch', async (req, res) => {
     if (webhook && tierName) {
         let imageUrl = b.image_url || null;
         if (!imageUrl) { for (const pet of pets) { imageUrl = await fetchWikiImage(pet.name); if (imageUrl) break; } }
-
-        const bestMut = (best.mutation && best.mutation !== 'None' && best.mutation !== '') ? best.mutation : 'Base';
-
-        // Build description matching reference style
-        let desc = `🏆 **Best**\n[${bestMut}] ${best.name} [${displayGen(best.gen)}]`;
-        if (pets.length > 1) {
-            desc += '\n\n♦ **Others**';
-            for (const pet of pets.slice(1)) {
-                const mut = (pet.mutation && pet.mutation !== 'None' && pet.mutation !== '') ? pet.mutation : 'Base';
-                desc += `\n• [${mut}] ${pet.name} [${displayGen(pet.gen)}]`;
-            }
-        }
-        desc += '\n\n💸 **Buy a Slot!**';
-
-        fireWebhook(webhook, {
-            title:       `⭐ Cerberus Notifier | ${tierName}`,
-            description: desc.slice(0, 3900),
-            color:       0x9B59B6,
-            thumbnail:   imageUrl ? { url: imageUrl } : undefined,
-            fields:      [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
-            footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
-            timestamp:   new Date().toISOString(),
-        });
+        const embed = buildEmbed(tierName, pets, { imageUrl, players: b.players });
+        fireWebhook(webhook, embed);
     }
 });
 
@@ -540,7 +542,6 @@ app.post('/submit', async (req, res) => {
     if (!b?.name) return res.status(400).json({ error: 'Missing name' });
     const jobId = b.job_id || 'unknown';
     if (isServerRateLimited(jobId)) return res.status(429).json({ error: 'Rate limited' });
-    // Pass mutation through explicitly so GUI shows the real mutation
     broadcast({
         type:     'brainrot',
         name:     b.name,
@@ -560,16 +561,13 @@ app.post('/submit', async (req, res) => {
     if (webhook && tierName) {
         let imageUrl = b.image_url || null;
         if (!imageUrl) imageUrl = await fetchWikiImage(b.name);
-        const mut = (b.mutation && b.mutation !== 'None' && b.mutation !== '') ? b.mutation : 'Base';
-        fireWebhook(webhook, {
-            title:       `⭐ Cerberus Notifier | ${tierName}`,
-            description: `🏆 **Best**\n[${mut}] ${b.name} [${displayGen(b.gen)}]\n\n💸 **Buy a Slot!**`,
-            color:       0x9B59B6,
-            thumbnail:   imageUrl ? { url: imageUrl } : undefined,
-            fields:      [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
-            footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
-            timestamp:   new Date().toISOString(),
-        });
+        // Single pet — wrap in array for buildEmbed
+        const embed = buildEmbed(tierName, [{
+            name:     b.name,
+            gen:      b.gen || '?',
+            mutation: b.mutation || 'None',
+        }], { imageUrl, players: b.players });
+        fireWebhook(webhook, embed);
     }
     res.json({ ok: true });
 });
@@ -594,25 +592,18 @@ wss.on('connection', async (ws, req) => {
     const rawUrl = req.url || '/';
     let token    = null;
 
-    // Method 1: token in URL path — /TOKEN
     const pathMatch = rawUrl.match(/^\/([a-f0-9]{64})(?:[/?]|$)/i);
     if (pathMatch) token = pathMatch[1];
-
-    // Method 2: query string
     if (!token) {
         const qi = rawUrl.indexOf('?');
         if (qi >= 0) {
             try { token = new URLSearchParams(rawUrl.slice(qi + 1)).get('token') || null; } catch {}
         }
     }
-
-    // Method 3: sec-websocket-protocol header
     if (!token) {
         const proto = req.headers['sec-websocket-protocol'];
         if (proto) token = proto.split(',')[0].trim() || null;
     }
-
-    // Method 4: Authorization Bearer header
     if (!token) {
         const auth = req.headers['authorization'] || '';
         if (auth.startsWith('Bearer ')) token = auth.slice(7).trim() || null;
@@ -622,28 +613,23 @@ wss.on('connection', async (ws, req) => {
 
     if (!token) {
         try { ws.send(JSON.stringify({ type: 'reconnect' })); } catch {}
-        ws.terminate();
-        return;
+        ws.terminate(); return;
     }
 
     const entry = consumeToken(token);
-
     if (!entry) {
         try { ws.send(JSON.stringify({ type: 'expired' })); } catch {}
-        ws.terminate();
-        return;
+        ws.terminate(); return;
     }
     if (entry.notFound) {
         try { ws.send(JSON.stringify({ type: 'reconnect' })); } catch {}
-        ws.terminate();
-        return;
+        ws.terminate(); return;
     }
 
     const { userKey, user } = entry;
-    ws._cerberusKey   = userKey;
-    ws._authExpire    = user ? user.auth_expire : null;
-    ws.isAlive        = true;
-    // FIX 7: grace counter — must fail N consecutive checks before kick
+    ws._cerberusKey    = userKey;
+    ws._authExpire     = user ? user.auth_expire : null;
+    ws.isAlive         = true;
     ws._validFailCount = 0;
 
     console.log('[WS] Connected:', userKey.slice(0, 8) + '…');
@@ -707,60 +693,41 @@ const heartbeatInterval = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeatInterval));
 
-// Hard expiry timer check — runs every 5s, uses cached auth_expire on socket
 setInterval(() => {
     if (wss.clients.size === 0) return;
     const now = Math.floor(Date.now() / 1000);
     for (const ws of wss.clients) {
         if (ws.readyState !== WebSocket.OPEN) continue;
-        // Only kick if we have a real non-zero expiry that has passed
         if (ws._authExpire && ws._authExpire !== -1 && ws._authExpire !== 0 && ws._authExpire <= now) {
             wsKick(ws);
         }
     }
 }, 5_000);
 
-// FIX 7: Soft re-validation every 60s against Luarmor.
-// A single failed check does NOT kick the user — they must fail
-// 3 consecutive checks (i.e. Luarmor must be broken for 3+ minutes)
-// before we act. This protects long-running sessions from Luarmor hiccups.
 setInterval(async () => {
     if (wss.clients.size === 0) return;
     const now     = Math.floor(Date.now() / 1000);
-    const users   = await getAllUsers(true);   // uses stale cache on error
+    const users   = await getAllUsers(true);
     const userMap = new Map(users.map(u => [u.user_key, u]));
-
     for (const ws of wss.clients) {
         if (ws.readyState !== WebSocket.OPEN || !ws._cerberusKey) continue;
         const u = userMap.get(ws._cerberusKey);
-
         if (!u) {
-            // Not found in Luarmor — could be a transient cache miss
             ws._validFailCount = (ws._validFailCount || 0) + 1;
-            if (ws._validFailCount >= 3) {
-                console.log('[WS] Kicking after 3 consecutive not-found checks:', ws._cerberusKey.slice(0,8));
-                wsKick(ws);
-            }
+            if (ws._validFailCount >= 3) wsKick(ws);
             continue;
         }
-
         const stillValid = !u.banned && (u.auth_expire === -1 || u.auth_expire === 0 || u.auth_expire > now);
         if (stillValid) {
-            ws._validFailCount = 0;  // reset grace counter on success
+            ws._validFailCount = 0;
             ws._authExpire = u.auth_expire;
         } else {
             ws._validFailCount = (ws._validFailCount || 0) + 1;
-            if (ws._validFailCount >= 3) {
-                console.log('[WS] Kicking after 3 consecutive invalid checks:', ws._cerberusKey.slice(0,8));
-                wsKick(ws);
-            } else {
-                console.log(`[WS] Invalid check ${ws._validFailCount}/3 for ${ws._cerberusKey.slice(0,8)}… (not kicking yet)`);
-            }
+            if (ws._validFailCount >= 3) wsKick(ws);
         }
     }
 }, 60_000);
 
-// Keepalive ping to all clients every 20s
 setInterval(() => {
     for (const client of wss.clients) {
         if (client.readyState === WebSocket.OPEN) {
@@ -855,7 +822,7 @@ async function updatePanel() {
         description: lines + (full ? '\n\n**All slots are full at the moment.**' : ''),
         color:       0x9B59B6,
         thumbnail:   { url: LOGO_URL },
-        footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
+        footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier', icon_url: LOGO_URL },
         timestamp:   new Date().toISOString(),
         fields: [{
             name:  full ? '⛔ All slots are full' : `✅ ${MAX_SLOTS-used} slot${MAX_SLOTS-used!==1?'s':''} available`,
@@ -897,7 +864,7 @@ async function handleMessage(msg) {
         const existing=await getKeyByDiscordId(discordId);
         if (existing&&(existing.auth_expire===-1||existing.auth_expire===0||existing.auth_expire>now)) return discordRequest('POST',`/channels/${msg.channel_id}/messages`,{content:`❌ <@${discordId}> already has an active slot.`});
         const key=await createKey(duration.seconds,discordId,duration.label);
-        if (!key) return discordRequest('POST',`/channels/${msg.channel_id}/messages`,{content:'❌ Failed to create key on Luarmor.'});
+        if (!key) return discordRequest('POST',`/channels/${msg.channel_id}/messages`,{content:'❌ Failed to create key on Luarmor. Check server logs for details.'});
         setTimeout(()=>{kickLiveSockets(key);schedulePanel(500);},duration.seconds*1000);
         const dmChannel=await discordRequest('POST','/users/@me/channels',{recipient_id:discordId});
         if (dmChannel) {
