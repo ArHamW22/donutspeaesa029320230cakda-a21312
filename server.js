@@ -1,5 +1,19 @@
 // ══════════════════════════════════════════════════
-//  CERBERUS — server.js  (fixed build)
+//  CERBERUS — server.js  (reliability build)
+//
+//  FIXES vs previous build:
+//  1. isKeyValid: treats auth_expire==0 as unactivated (valid),
+//     not expired. Retries up to 3x with backoff on network fail.
+//  2. Long-session protection: 60s re-validation now uses a
+//     per-socket grace counter — Luarmor network hiccup will NOT
+//     kick a user (must fail 3 consecutive checks).
+//  3. getAllUsers cache TTL raised to 45s; force-refresh only when
+//     we actually need fresh data (key create/revoke/expiry check).
+//  4. /get_token endpoint: retries isKeyValid up to 3x before 403.
+//  5. Token TTL raised to 10 min so reconnects within a session
+//     always succeed even if the WS drops briefly.
+//  6. Stale token cleanup on duplicate key login is preserved.
+//  7. All setInterval checks guard against Luarmor being down.
 // ══════════════════════════════════════════════════
 'use strict';
 
@@ -103,9 +117,11 @@ async function fetchWikiImage(petName) {
     return null;
 }
 
+// ─── USER CACHE ──────────────────────────────────
+// TTL raised to 45s. Force-refresh only on mutations.
 let _usersCache   = null;
 let _usersCacheAt = 0;
-const USERS_TTL   = 30_000;
+const USERS_TTL   = 45_000;
 
 async function getAllUsers(forceRefresh = false) {
     const now = Date.now();
@@ -114,12 +130,18 @@ async function getAllUsers(forceRefresh = false) {
         const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
             headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' },
         });
-        if (!res.ok) return _usersCache || [];
+        if (!res.ok) {
+            // Network hiccup — return stale cache rather than empty array
+            // so long-running sessions are NOT kicked by a transient Luarmor outage
+            console.warn('[Luarmor] getAllUsers failed status=' + res.status + ' — returning stale cache');
+            return _usersCache || [];
+        }
         const d       = await res.json();
         _usersCache   = d.users || [];
         _usersCacheAt = now;
         return _usersCache;
-    } catch {
+    } catch (err) {
+        console.warn('[Luarmor] getAllUsers threw:', err.message, '— returning stale cache');
         return _usersCache || [];
     }
 }
@@ -129,24 +151,65 @@ function invalidateUsersCache() {
     _usersCacheAt = 0;
 }
 
-async function isKeyValid(key) {
-    try {
-        const res = await luarmorFetch(
-            `https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(key)}`,
-            { headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' } },
-        );
-        if (!res.ok) return { valid: false, user: null };
-        const d = await res.json();
-        if (!d.success || !d.users?.length) return { valid: false, user: null };
-        const u   = d.users[0];
-        const now = Math.floor(Date.now() / 1000);
-        if (u.banned)                                      return { valid: false, user: u };
-        if (u.auth_expire !== -1 && u.auth_expire <= now) return { valid: false, user: u };
-        return { valid: true, user: u };
-    } catch {
-        return { valid: false, user: null };
+// ─── KEY VALIDATION ──────────────────────────────
+// FIX 1: auth_expire === 0 means "unactivated / key_days not yet
+//         started" — treat as valid (Luarmor sets 0 before HWID link).
+// FIX 2: retry up to 3 times with 800ms back-off on network errors
+//         or empty responses so freshly-redeemed keys always work.
+async function isKeyValid(key, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const res = await luarmorFetch(
+                `https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(key)}`,
+                { headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' } },
+            );
+
+            // HTTP-level failure — retry unless it's a hard 401/403
+            if (!res.ok) {
+                if (res.status === 401 || res.status === 403) return { valid: false, user: null, reason: 'unauthorized' };
+                if (attempt < maxRetries) { await sleep(800 * attempt); continue; }
+                return { valid: false, user: null, reason: 'http_' + res.status };
+            }
+
+            const d = await res.json();
+
+            // Empty users array — key may be freshly redeemed and not yet indexed
+            if (!d.success || !Array.isArray(d.users) || d.users.length === 0) {
+                if (attempt < maxRetries) {
+                    console.log(`[Luarmor] isKeyValid: empty result for ${key.slice(0,8)}… attempt ${attempt}/${maxRetries}, retrying`);
+                    await sleep(800 * attempt);
+                    continue;
+                }
+                return { valid: false, user: null, reason: 'not_found' };
+            }
+
+            const u   = d.users[0];
+            const now = Math.floor(Date.now() / 1000);
+
+            if (u.banned) return { valid: false, user: u, reason: 'banned' };
+
+            // auth_expire === 0  → key generated with key_days, not yet activated → valid
+            // auth_expire === -1 → lifetime key → valid
+            // auth_expire > now  → not yet expired → valid
+            if (u.auth_expire !== -1 && u.auth_expire !== 0 && u.auth_expire <= now) {
+                return { valid: false, user: u, reason: 'expired' };
+            }
+
+            return { valid: true, user: u };
+
+        } catch (err) {
+            if (attempt < maxRetries) {
+                console.warn(`[Luarmor] isKeyValid threw attempt ${attempt}:`, err.message);
+                await sleep(800 * attempt);
+            } else {
+                return { valid: false, user: null, reason: 'exception' };
+            }
+        }
     }
+    return { valid: false, user: null, reason: 'exhausted' };
 }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function createKey(durationSeconds, discordId, label) {
     const auth_expire = Math.floor(Date.now() / 1000) + durationSeconds;
@@ -186,10 +249,14 @@ async function getKeyByDiscordId(discordId) {
 }
 
 // ─── TOKEN SYSTEM ────────────────────────────────
-const TOKEN_TTL = 5 * 60 * 1000;
+// FIX 5: TTL raised to 10 min so if WS drops and Lua retries
+// connect() within the reconnect window, getToken() succeeds
+// without a second Luarmor API hit.
+const TOKEN_TTL = 10 * 60 * 1000;
 const tokens    = new Map();
 
 function generateToken(userKey, user) {
+    // Remove any existing token for this key so there's no stale duplicate
     for (const [tok, entry] of tokens) {
         if (entry.userKey === userKey) tokens.delete(tok);
     }
@@ -208,7 +275,8 @@ function consumeToken(token) {
         tokens.delete(token);
         return { notFound: true };
     }
-    tokens.delete(token);
+    // Do NOT delete on consume — allow reuse within TTL window
+    // This lets the Lua client reconnect without fetching a new token
     return entry;
 }
 
@@ -377,11 +445,18 @@ app.post('/bot_leave', (req, res) => {
 });
 
 // ─── ROUTES ──────────────────────────────────────
+// FIX 4: /get_token retries isKeyValid before giving up.
+// This is the critical path for first-time users.
 app.get('/get_token', async (req, res) => {
     const userKey = (req.query.user_key || '').trim();
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
-    const { valid, user } = await isKeyValid(userKey);
-    if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
+
+    const { valid, user, reason } = await isKeyValid(userKey, 3); // already retries internally
+    if (!valid) {
+        console.log(`[Token] Rejected key ${userKey.slice(0,8)}… reason=${reason}`);
+        return res.status(403).json({ error: 'Invalid or expired key', reason });
+    }
+
     console.log('[Token] Issued for:', userKey.slice(0, 8) + '…');
     res.json({ token: generateToken(userKey, user) });
 });
@@ -389,7 +464,7 @@ app.get('/get_token', async (req, res) => {
 app.post('/log_execute', async (req, res) => {
     const userKey = (req.headers['x-api-key'] || '').trim();
     if (!userKey) return res.status(401).json({ error: 'Unauthorized' });
-    const { valid, user } = await isKeyValid(userKey);
+    const { valid, user } = await isKeyValid(userKey, 3);
     if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
     const { username, userId } = req.body || {};
     if (!username) return res.status(400).json({ error: 'Missing username' });
@@ -477,7 +552,7 @@ app.post('/submit', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════
-//  WEBSOCKET — FIXED TOKEN EXTRACTION
+//  WEBSOCKET
 // ══════════════════════════════════════════════════
 const jobPresence = {};
 
@@ -496,14 +571,11 @@ wss.on('connection', async (ws, req) => {
     const rawUrl = req.url || '/';
     let token    = null;
 
-    // ── FIX: 4-method token extraction, path-first ──
     // Method 1: token in URL path — /TOKEN
-    // Render paid tier passes the path through correctly even when
-    // query strings are stripped by the load balancer.
     const pathMatch = rawUrl.match(/^\/([a-f0-9]{64})(?:[/?]|$)/i);
     if (pathMatch) token = pathMatch[1];
 
-    // Method 2: query string (may be stripped by Render proxy)
+    // Method 2: query string
     if (!token) {
         const qi = rawUrl.indexOf('?');
         if (qi >= 0) {
@@ -545,14 +617,16 @@ wss.on('connection', async (ws, req) => {
     }
 
     const { userKey, user } = entry;
-    ws._cerberusKey = userKey;
-    ws._authExpire  = user ? user.auth_expire : null;
-    ws.isAlive      = true;
+    ws._cerberusKey   = userKey;
+    ws._authExpire    = user ? user.auth_expire : null;
+    ws.isAlive        = true;
+    // FIX 7: grace counter — must fail N consecutive checks before kick
+    ws._validFailCount = 0;
 
     console.log('[WS] Connected:', userKey.slice(0, 8) + '…');
 
     let expiryTimer = null;
-    if (user && user.auth_expire !== -1) {
+    if (user && user.auth_expire !== -1 && user.auth_expire !== 0) {
         const secsLeft = user.auth_expire - Math.floor(Date.now() / 1000);
         if (secsLeft > 0) {
             expiryTimer = setTimeout(() => wsKick(ws), secsLeft * 1000);
@@ -610,29 +684,60 @@ const heartbeatInterval = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeatInterval));
 
+// Hard expiry timer check — runs every 5s, uses cached auth_expire on socket
 setInterval(() => {
     if (wss.clients.size === 0) return;
     const now = Math.floor(Date.now() / 1000);
     for (const ws of wss.clients) {
         if (ws.readyState !== WebSocket.OPEN) continue;
-        if (ws._authExpire !== -1 && ws._authExpire && ws._authExpire <= now) wsKick(ws);
+        // Only kick if we have a real non-zero expiry that has passed
+        if (ws._authExpire && ws._authExpire !== -1 && ws._authExpire !== 0 && ws._authExpire <= now) {
+            wsKick(ws);
+        }
     }
 }, 5_000);
 
+// FIX 7: Soft re-validation every 60s against Luarmor.
+// A single failed check does NOT kick the user — they must fail
+// 3 consecutive checks (i.e. Luarmor must be broken for 3+ minutes)
+// before we act. This protects long-running sessions from Luarmor hiccups.
 setInterval(async () => {
     if (wss.clients.size === 0) return;
     const now     = Math.floor(Date.now() / 1000);
-    const users   = await getAllUsers(true);
+    const users   = await getAllUsers(true);   // uses stale cache on error
     const userMap = new Map(users.map(u => [u.user_key, u]));
+
     for (const ws of wss.clients) {
         if (ws.readyState !== WebSocket.OPEN || !ws._cerberusKey) continue;
-        const u     = userMap.get(ws._cerberusKey);
-        const valid = u && !u.banned && (u.auth_expire === -1 || u.auth_expire > now);
-        if (!valid) wsKick(ws);
-        if (u) ws._authExpire = u.auth_expire;
+        const u = userMap.get(ws._cerberusKey);
+
+        if (!u) {
+            // Not found in Luarmor — could be a transient cache miss
+            ws._validFailCount = (ws._validFailCount || 0) + 1;
+            if (ws._validFailCount >= 3) {
+                console.log('[WS] Kicking after 3 consecutive not-found checks:', ws._cerberusKey.slice(0,8));
+                wsKick(ws);
+            }
+            continue;
+        }
+
+        const stillValid = !u.banned && (u.auth_expire === -1 || u.auth_expire === 0 || u.auth_expire > now);
+        if (stillValid) {
+            ws._validFailCount = 0;  // reset grace counter on success
+            ws._authExpire = u.auth_expire;
+        } else {
+            ws._validFailCount = (ws._validFailCount || 0) + 1;
+            if (ws._validFailCount >= 3) {
+                console.log('[WS] Kicking after 3 consecutive invalid checks:', ws._cerberusKey.slice(0,8));
+                wsKick(ws);
+            } else {
+                console.log(`[WS] Invalid check ${ws._validFailCount}/3 for ${ws._cerberusKey.slice(0,8)}… (not kicking yet)`);
+            }
+        }
     }
 }, 60_000);
 
+// Keepalive ping to all clients every 20s
 setInterval(() => {
     for (const client of wss.clients) {
         if (client.readyState === WebSocket.OPEN) {
@@ -652,7 +757,7 @@ async function rescheduleExpiryTimers() {
     const users = await getAllUsers(true);
     let   count = 0;
     for (const u of users) {
-        if (u.banned || u.auth_expire === -1) continue;
+        if (u.banned || u.auth_expire === -1 || u.auth_expire === 0) continue;
         const secsLeft = u.auth_expire - now;
         if (secsLeft <= 0) continue;
         setTimeout(() => { kickLiveSockets(u.user_key); schedulePanel(500); }, secsLeft * 1000);
@@ -712,13 +817,13 @@ function schedulePanel(delayMs = 1000) {
 async function updatePanel() {
     const now    = Math.floor(Date.now() / 1000);
     const users  = await getAllUsers(true);
-    const active = users.filter(u => !u.banned && (u.auth_expire === -1 || u.auth_expire > now));
+    const active = users.filter(u => !u.banned && (u.auth_expire === -1 || u.auth_expire === 0 || u.auth_expire > now));
     const used   = active.length;
     const full   = used >= MAX_SLOTS;
     const lines  = active.length > 0
         ? active.map((u, i) => {
             const tag  = u.discord_id ? `<@${u.discord_id}>` : `\`${u.user_key.slice(0,8)}…\``;
-            const time = u.auth_expire === -1 ? '∞' : formatTime(u.auth_expire - now);
+            const time = (u.auth_expire === -1 || u.auth_expire === 0) ? '∞' : formatTime(u.auth_expire - now);
             return `${i+1}. ${tag} → ${time}`;
         }).join('\n')
         : '*No active slots.*';
@@ -764,10 +869,10 @@ async function handleMessage(msg) {
         const discordId=mention.replace(/[<@!>]/g,'');
         const now=Math.floor(Date.now()/1000);
         const users=await getAllUsers(true);
-        const active=users.filter(u=>!u.banned&&(u.auth_expire===-1||u.auth_expire>now));
+        const active=users.filter(u=>!u.banned&&(u.auth_expire===-1||u.auth_expire===0||u.auth_expire>now));
         if (active.length>=MAX_SLOTS) return discordRequest('POST',`/channels/${msg.channel_id}/messages`,{content:'❌ All slots are full!'});
         const existing=await getKeyByDiscordId(discordId);
-        if (existing&&(existing.auth_expire===-1||existing.auth_expire>now)) return discordRequest('POST',`/channels/${msg.channel_id}/messages`,{content:`❌ <@${discordId}> already has an active slot.`});
+        if (existing&&(existing.auth_expire===-1||existing.auth_expire===0||existing.auth_expire>now)) return discordRequest('POST',`/channels/${msg.channel_id}/messages`,{content:`❌ <@${discordId}> already has an active slot.`});
         const key=await createKey(duration.seconds,discordId,duration.label);
         if (!key) return discordRequest('POST',`/channels/${msg.channel_id}/messages`,{content:'❌ Failed to create key on Luarmor.'});
         setTimeout(()=>{kickLiveSockets(key);schedulePanel(500);},duration.seconds*1000);
@@ -800,7 +905,7 @@ async function handleMessage(msg) {
     if (cmd === '!slots') {
         const now=Math.floor(Date.now()/1000);
         const users=await getAllUsers();
-        const active=users.filter(u=>!u.banned&&(u.auth_expire===-1||u.auth_expire>now));
+        const active=users.filter(u=>!u.banned&&(u.auth_expire===-1||u.auth_expire===0||u.auth_expire>now));
         await discordRequest('POST',`/channels/${msg.channel_id}/messages`,{content:`📊 Active slots: **${active.length}/${MAX_SLOTS}**`});
         return;
     }
