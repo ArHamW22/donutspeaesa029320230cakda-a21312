@@ -49,28 +49,15 @@ async function luarmorFetch(url, options = {}) {
 }
 
 // ─── ENV ─────────────────────────────────────────
-const API_KEY      = process.env.API_KEY;
-const LRM_KEY      = process.env.LRM_KEY;
-const LRM_PID      = process.env.LRM_PID;
-const BOT_TOKEN    = process.env.BOT_TOKEN;
-const CHANNEL_ID   = process.env.CHANNEL_ID;
-const FETCHER_URL  = process.env.FETCHER_URL || 'http://82.11.247.18:5000';
-const PING_ROLE_ID = process.env.PING_ROLE_ID || ''; // set this env var to your role ID
-const MAX_SLOTS    = 7;
-const LOGO_URL     = 'https://media.discordapp.net/attachments/1487763701040680971/1489669239202644089/image.png';
-const ADMIN_IDS    = new Set(['1405960794503647324']);
-
-console.log('[ENV] API_KEY set:',    !!API_KEY);
-console.log('[ENV] LRM_KEY set:',    !!LRM_KEY);
-console.log('[ENV] LRM_PID:',         LRM_PID);
-console.log('[ENV] BOT_TOKEN set:',  !!BOT_TOKEN);
-console.log('[ENV] CHANNEL_ID:',      CHANNEL_ID);
-console.log('[ENV] FETCHER_URL:',     FETCHER_URL);
-console.log('[ENV] PING_ROLE_ID:',    PING_ROLE_ID || '(not set — no ping)');
-if (!process.env.WEBHOOK_50_400M)    console.warn('[ENV] WARNING: WEBHOOK_50_400M not set');
-if (!process.env.WEBHOOK_400_999M)   console.warn('[ENV] WARNING: WEBHOOK_400_999M not set');
-if (!process.env.WEBHOOK_999M_PLUS)  console.warn('[ENV] WARNING: WEBHOOK_999M_PLUS not set');
-if (!process.env.WEBHOOK_EXECUTIONS) console.warn('[ENV] WARNING: WEBHOOK_EXECUTIONS not set');
+const API_KEY    = process.env.API_KEY;
+const LRM_KEY    = process.env.LRM_KEY;
+const LRM_PID    = process.env.LRM_PID;
+const BOT_TOKEN  = process.env.BOT_TOKEN;
+const CHANNEL_ID = process.env.CHANNEL_ID;
+const FETCHER_URL = process.env.FETCHER_URL || 'http://82.11.247.18:5000';
+const MAX_SLOTS  = 7;
+const LOGO_URL   = 'https://media.discordapp.net/attachments/1487763701040680971/1489669239202644089/image.png';
+const ADMIN_IDS  = new Set(['1405960794503647324']);
 
 if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
     console.error('[ENV] Missing required env vars — exiting');
@@ -79,8 +66,8 @@ if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
 
 app.get('/', (_req, res) => res.send('online'));
 
-// ─── GEN / VALUE PARSER ──────────────────────────
-function parseNum(raw) {
+// ─── GEN RATE PARSER ─────────────────────────────
+function parseGen(raw) {
     if (!raw || raw === '?' || raw === '') return 0;
     const s = String(raw).toLowerCase().replace(/[\$,\s%]/g, '').replace(/\/s$/, '');
     const n = parseFloat(s.match(/-?\d+\.?\d*/)?.[0] || '0') || 0;
@@ -90,10 +77,10 @@ function parseNum(raw) {
     return n;
 }
 
-// ─── WIKI IMAGE (server-side) ────────────────────
+// ─── WIKI IMAGE FETCH ────────────────────────────
 async function fetchWikiImage(petName) {
     try {
-        const encoded = encodeURIComponent(String(petName).replace(/ /g, '_'));
+        const encoded = encodeURIComponent(petName.replace(/ /g, '_'));
         const url = `https://stealabrainrot.fandom.com/api.php?action=query&prop=pageimages&format=json&piprop=thumbnail&pithumbsize=500&titles=${encoded}`;
         const res = await axios.get(url, { timeout: 8_000 });
         const pages = res.data?.query?.pages;
@@ -103,7 +90,7 @@ async function fetchWikiImage(petName) {
             }
         }
     } catch (e) {
-        console.warn('[Wiki] fetch failed for', petName, ':', e.message);
+        // silent
     }
     return null;
 }
@@ -126,12 +113,14 @@ async function getAllUsers(forceRefresh = false) {
         _usersCacheAt = now;
         return _usersCache;
     } catch (e) {
-        console.error('[Luarmor] getAllUsers error:', e.message);
         return _usersCache || [];
     }
 }
 
-function invalidateUsersCache() { _usersCache = null; _usersCacheAt = 0; }
+function invalidateUsersCache() {
+    _usersCache   = null;
+    _usersCacheAt = 0;
+}
 
 async function isKeyValid(key) {
     try {
@@ -147,7 +136,9 @@ async function isKeyValid(key) {
         if (u.banned)                                      return { valid: false, user: u };
         if (u.auth_expire !== -1 && u.auth_expire <= now) return { valid: false, user: u };
         return { valid: true, user: u };
-    } catch { return { valid: false, user: null }; }
+    } catch {
+        return { valid: false, user: null };
+    }
 }
 
 async function createKey(durationSeconds, discordId, label) {
@@ -161,11 +152,13 @@ async function createKey(durationSeconds, discordId, label) {
         const text = await res.text();
         let d;
         try { d = JSON.parse(text); }
-        catch { console.error('[Luarmor] createKey non-JSON:', text.slice(0, 200)); return null; }
-        if (!d.success) { console.error('[Luarmor] createKey failed:', JSON.stringify(d)); return null; }
+        catch { return null; }
+        if (!d.success) { return null; }
         invalidateUsersCache();
         return d.user_key;
-    } catch (e) { console.error('[Luarmor] createKey error:', e.message); return null; }
+    } catch (e) {
+        return null;
+    }
 }
 
 async function revokeKey(userKey) {
@@ -176,7 +169,9 @@ async function revokeKey(userKey) {
         );
         if (res.ok) invalidateUsersCache();
         return res.ok;
-    } catch (e) { console.error('[Luarmor] revokeKey error:', e.message); return false; }
+    } catch (e) {
+        return false;
+    }
 }
 
 async function getKeyByDiscordId(discordId) {
@@ -185,33 +180,31 @@ async function getKeyByDiscordId(discordId) {
 }
 
 // ─── TOKEN SYSTEM ────────────────────────────────
-const TOKEN_TTL = 300_000; // 5 min
-const tokens    = new Map();
+const tokens = new Map();
 
 function generateToken(userKey, user) {
-    for (const [tok, entry] of tokens) {
-        if (entry.userKey === userKey && Date.now() < entry.expires) {
-            entry.expires = Date.now() + TOKEN_TTL;
-            return tok;
-        }
-    }
     const token   = crypto.randomBytes(32).toString('hex');
-    const expires = Date.now() + TOKEN_TTL;
+    const expires = Date.now() + 60_000;
     tokens.set(token, { userKey, user, expires });
-    setTimeout(() => tokens.delete(token), TOKEN_TTL);
+    setTimeout(() => tokens.delete(token), 60_000);
     return token;
 }
 
 function consumeToken(token) {
-    if (!token) return null;
+    if (!token) { console.log('[Token] consumeToken: no token provided'); return null; }
     const entry = tokens.get(token);
-    if (!entry) return null;
-    if (Date.now() > entry.expires) { tokens.delete(token); return null; }
-    return entry; // NOT deleted — reusable for 5min
+    if (!entry) { console.log('[Token] consumeToken: token not found (already used or never issued)'); return null; }
+    if (Date.now() > entry.expires) {
+        tokens.delete(token);
+        console.log('[Token] consumeToken: expired');
+        return null;
+    }
+    // Do NOT delete — keep token reusable for its full TTL so reconnects work
+    console.log('[Token] consumeToken: OK for key', entry.userKey?.slice(0,8) + '…');
+    return entry;
 }
 
 // ─── RATE LIMITING ───────────────────────────────
-// Per-server cooldown only — all pets from one scan always get through
 const serverSubmitTimes = new Map();
 const globalSubmits     = [];
 const SERVER_COOLDOWN   = 30_000;
@@ -249,17 +242,37 @@ function wsKick(ws) {
     setTimeout(() => { try { ws.terminate(); } catch {} }, 300);
 }
 
-const PING_BUF    = Buffer.from(JSON.stringify({ type: 'ping' }));
-const EXPIRED_BUF = Buffer.from(JSON.stringify({ type: 'expired' }));
+const PING_STR    = JSON.stringify({ type: 'ping' });
+const EXPIRED_STR = JSON.stringify({ type: 'expired' });
 
 function broadcast(obj, excludeWs = null) {
-    const buf = Buffer.from(JSON.stringify(obj));
+    const str = JSON.stringify(obj);
     for (const client of wss.clients) {
         if (client === excludeWs) continue;
         if (client.readyState === WebSocket.OPEN) {
-            try { client.send(buf); } catch {}
+            try { client.send(str); } catch {}
         }
     }
+}
+
+// FIX: staggered broadcast so each pet in a batch arrives at the client
+// at least 150ms apart. The old code fired all broadcasts in a tight for-loop,
+// meaning all pets from the same server hit the client within ~1ms of each other.
+// Even with the name+job+gen dedup key fix on the client, sending them all
+// simultaneously increases the chance of race conditions and dropped rows.
+// 150ms stagger = 6-7 pets visible before the first one expires (60s window).
+function broadcastStaggered(pets, basePayload) {
+    pets.forEach((pet, i) => {
+        setTimeout(() => {
+            broadcast({
+                ...basePayload,
+                name:     pet.name,
+                gen:      pet.gen || '?',
+                mutation: pet.mutation || 'None',
+                value:    pet.value || 0,
+            });
+        }, i * 150);
+    });
 }
 
 // ─── WEBHOOK ─────────────────────────────────────
@@ -268,20 +281,17 @@ function displayGen(gen) {
     return String(gen);
 }
 
-async function fireWebhook(webhookUrl, embedData, content = '') {
-    try {
-        await axios.post(webhookUrl, {
-            content,
-            embeds: [embedData],
-        }, { timeout: 8_000 });
-    } catch (e) {
-        console.warn('[Webhook] Failed:', e.message);
-    }
+function fireWebhook(webhook, embedData) {
+    fetch(webhook, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ embeds: [embedData] }),
+    }).catch(() => {});
 }
 
-// ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════
 //  BOT JOB TRACKING
-// ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════
 const botJobMap  = new Map();
 const botCurrent = new Map();
 
@@ -290,7 +300,6 @@ function botJoin(userKey, jobId) {
     botCurrent.set(userKey, jobId);
     if (!botJobMap.has(jobId)) botJobMap.set(jobId, new Set());
     botJobMap.get(jobId).add(userKey);
-    console.log(`[BotTrack] ${userKey.slice(0,8)}… joined ${jobId}`);
 }
 
 function botLeave(userKey) {
@@ -298,7 +307,10 @@ function botLeave(userKey) {
     if (!oldJob) return;
     botCurrent.delete(userKey);
     const set = botJobMap.get(oldJob);
-    if (set) { set.delete(userKey); if (set.size === 0) botJobMap.delete(oldJob); }
+    if (set) {
+        set.delete(userKey);
+        if (set.size === 0) botJobMap.delete(oldJob);
+    }
 }
 
 function isJobOccupied(jobId) {
@@ -307,28 +319,27 @@ function isJobOccupied(jobId) {
 }
 
 async function getNextServerFromFetcher(requestingUserKey) {
-    const skipped = [];
     for (let i = 0; i < 10; i++) {
         let data;
         try {
             const res = await axios.get(`${FETCHER_URL}/next_server`, { timeout: 8_000 });
             data = res.data;
-        } catch (e) { console.warn('[Fetcher] Error:', e.message); return null; }
+        } catch {
+            return null;
+        }
         if (!data || data.error || !data.job_id) return null;
         const jobId = data.job_id;
-        if (!isJobOccupied(jobId)) {
-            console.log(`[Fetcher] Giving ${jobId} to ${requestingUserKey.slice(0,8)}… (skipped ${skipped.length})`);
-            return jobId;
-        }
-        skipped.push(jobId);
-        try { await axios.post(`${FETCHER_URL}/visited`, { job_id: jobId }, { timeout: 4_000 }); } catch {}
+        if (!isJobOccupied(jobId)) return jobId;
+        try {
+            await axios.post(`${FETCHER_URL}/visited`, { job_id: jobId }, { timeout: 4_000 });
+        } catch {}
     }
     return null;
 }
 
-// ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════
 //  SCAN COORDINATION
-// ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════
 const hopApproved = new Set();
 
 app.post('/scan_done', (req, res) => {
@@ -345,7 +356,10 @@ app.get('/should_hop', (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const jobId = (req.query.job_id || '').trim();
     if (!jobId) return res.status(400).json({ error: 'Missing job_id' });
-    if (hopApproved.has(jobId)) { hopApproved.delete(jobId); return res.json({ hop: true }); }
+    if (hopApproved.has(jobId)) {
+        hopApproved.delete(jobId);
+        return res.json({ hop: true });
+    }
     res.json({ hop: false });
 });
 
@@ -361,7 +375,7 @@ app.get('/next_server', async (req, res) => {
 app.post('/bot_join', (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const { job_id, user_key } = req.body || {};
-    if (!job_id || !user_key) return res.status(400).json({ error: 'Missing fields' });
+    if (!job_id || !user_key) return res.status(400).json({ error: 'Missing job_id or user_key' });
     botJoin(user_key, job_id);
     res.json({ ok: true });
 });
@@ -380,7 +394,6 @@ app.get('/get_token', async (req, res) => {
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
     const { valid, user } = await isKeyValid(userKey);
     if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
-    console.log('[Token] Issued for key:', userKey.slice(0, 8) + '…');
     res.json({ token: generateToken(userKey, user) });
 });
 
@@ -393,7 +406,6 @@ app.post('/log_execute', async (req, res) => {
     if (!username) return res.status(400).json({ error: 'Missing username' });
     const discordId  = user?.discord_id || null;
     const discordTag = discordId ? `<@${discordId}>` : 'Unknown';
-    console.log(`[Execute] ${username} (${userId}) — Discord: ${discordId || 'unknown'}`);
     const webhook = process.env.WEBHOOK_EXECUTIONS;
     if (webhook) {
         fireWebhook(webhook, {
@@ -417,54 +429,43 @@ app.post('/submit_batch', async (req, res) => {
         return res.status(400).json({ error: 'Missing pets array' });
     const jobId = b.job_id || 'unknown';
 
-    // Per-server rate limit — prevents duplicate submits from same server
-    if (isServerRateLimited(jobId)) {
-        console.log(`[Batch] Rate limited server: ${jobId}`);
-        return res.status(429).json({ error: 'Rate limited' });
-    }
+    if (isServerRateLimited(jobId)) return res.status(429).json({ error: 'Rate limited' });
 
-    // Sort by value descending — keep ALL pets (no per-pet filtering)
-    const pets    = [...b.pets].sort((a, bb) => parseNum(bb.gen) - parseNum(a.gen));
+    const pets    = [...b.pets].sort((a, bb) => parseGen(bb.gen) - parseGen(a.gen));
     const best    = pets[0];
-    const bestVal = parseNum(best.gen);
+    const bestGen = parseGen(best.gen);
 
-    console.log(`[Batch] ${pets.length} pets | best=${best.name} val=${bestVal}`);
+    // FIX: use staggered broadcast instead of tight for-loop.
+    // Original: pets.forEach(pet => broadcast({...})) fired all at once.
+    // All messages arrived at the client within ~1ms, all sharing the same
+    // job_id. The client dedup (even with gen in the key) can still hit
+    // race conditions at that speed. 150ms between each pet is imperceptible
+    // to users and guarantees each one clears the dedup window cleanly.
+    broadcastStaggered(pets, {
+        type:     'brainrot',
+        job_id:   b.job_id || '',
+        place_id: b.place_id || '',
+    });
 
-    // Broadcast ALL pets to WebSocket clients
-    for (const pet of pets) {
-        broadcast({
-            type:     'brainrot',
-            name:     pet.name,
-            gen:      pet.gen   || '?',
-            mutation: pet.mutation || 'None',
-            value:    pet.value || 0,
-            job_id:   b.job_id  || '',
-            place_id: b.place_id || '',
-        });
-    }
+    // Respond immediately — don't make scanner wait for staggered sends
+    res.json({ ok: true });
 
-    // Webhook tier
-    let webhookUrl = null;
-    if      (bestVal >= 999e6) webhookUrl = process.env.WEBHOOK_999M_PLUS;
-    else if (bestVal >= 400e6) webhookUrl = process.env.WEBHOOK_400_999M;
-    else if (bestVal >= 50e6)  webhookUrl = process.env.WEBHOOK_50_400M;
+    // Webhook fires async after response
+    let webhook = null;
+    if      (bestGen >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
+    else if (bestGen >= 400e6) webhook = process.env.WEBHOOK_400_999M;
+    else if (bestGen >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
 
-    console.log(`[Batch] webhook=${webhookUrl ? 'yes' : 'no (below threshold)'}`);
-
-    if (webhookUrl) {
-        // Image: try client-provided first, then server-side wiki fetch
+    if (webhook) {
         let imageUrl = b.image_url || null;
         if (!imageUrl) {
-            console.log(`[Batch] No client image — fetching from wiki for: ${best.name}`);
             for (const pet of pets) {
                 imageUrl = await fetchWikiImage(pet.name);
-                if (imageUrl) { console.log(`[Batch] Wiki image found for: ${pet.name}`); break; }
+                if (imageUrl) break;
             }
         }
-        console.log(`[Batch] image_url: ${imageUrl || 'none'}`);
 
         const bestMut = best.mutation && best.mutation !== 'None' ? best.mutation : 'Base';
-
         let desc = `🏆 **Best**\n[${bestMut}] ${best.name} [${displayGen(best.gen)}]`;
         const others = pets.slice(1);
         if (others.length > 0) {
@@ -476,10 +477,7 @@ app.post('/submit_batch', async (req, res) => {
         }
         desc += '\n\n💸 **Buy a Slot!**';
 
-        // Role ping content — set PING_ROLE_ID env var to enable
-        const pingContent = PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : '';
-
-        await fireWebhook(webhookUrl, {
+        fireWebhook(webhook, {
             title:       '⭐ Cerberus Notifier | Finds',
             description: desc.slice(0, 3900),
             color:       0x9B59B6,
@@ -487,10 +485,8 @@ app.post('/submit_batch', async (req, res) => {
             fields:      [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
             footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
             timestamp:   new Date().toISOString(),
-        }, pingContent);
+        });
     }
-
-    res.json({ ok: true });
 });
 
 // ── /submit (single pet) ─────────────────────────
@@ -508,20 +504,18 @@ app.post('/submit', async (req, res) => {
         value: b.value || 0, job_id: b.job_id || '', place_id: b.place_id || '',
     });
 
-    const val = parseNum(b.gen);
-    let webhookUrl = null;
-    if      (val >= 999e6) webhookUrl = process.env.WEBHOOK_999M_PLUS;
-    else if (val >= 400e6) webhookUrl = process.env.WEBHOOK_400_999M;
-    else if (val >= 50e6)  webhookUrl = process.env.WEBHOOK_50_400M;
+    const genVal = parseGen(b.gen);
+    let webhook = null;
+    if      (genVal >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
+    else if (genVal >= 400e6) webhook = process.env.WEBHOOK_400_999M;
+    else if (genVal >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
 
-    if (webhookUrl) {
+    if (webhook) {
         let imageUrl = b.image_url || null;
         if (!imageUrl) imageUrl = await fetchWikiImage(b.name);
 
         const mut = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
-        const pingContent = PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : '';
-
-        await fireWebhook(webhookUrl, {
+        fireWebhook(webhook, {
             title:       '⭐ Cerberus Notifier | Find',
             description: `🏆 **Best**\n[${mut}] ${b.name} [${displayGen(b.gen)}]\n\n💸 **Buy a Slot!**`,
             color:       0x9B59B6,
@@ -529,14 +523,14 @@ app.post('/submit', async (req, res) => {
             fields:      [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
             footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
             timestamp:   new Date().toISOString(),
-        }, pingContent);
+        });
     }
     res.json({ ok: true });
 });
 
-// ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════
 //  WEBSOCKET
-// ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════
 const jobPresence = {};
 
 function presenceJoin(jobId, username) {
@@ -562,12 +556,9 @@ wss.on('connection', async (ws, req) => {
         if (proto) token = proto.split(',')[0].trim() || null;
     }
 
-    console.log('[WS] Auth attempt, token present:', !!token);
-
     const entry = consumeToken(token);
     if (!entry) {
-        console.log('[WS] Auth failed — invalid or expired token');
-        try { ws.send(EXPIRED_BUF); } catch {}
+        try { ws.send(EXPIRED_STR); } catch {}
         ws.terminate();
         return;
     }
@@ -577,18 +568,14 @@ wss.on('connection', async (ws, req) => {
     ws._authExpire  = user ? user.auth_expire : null;
     ws.isAlive      = true;
 
-    console.log('[WS] Connected:', userKey.slice(0, 8) + '…');
-
     let expiryTimer = null;
     if (user && user.auth_expire !== -1) {
         const secsLeft = user.auth_expire - Math.floor(Date.now() / 1000);
         if (secsLeft > 0) {
-            expiryTimer = setTimeout(() => {
-                console.log('[WS] Key expired, kicking:', userKey.slice(0, 8) + '…');
-                wsKick(ws);
-            }, secsLeft * 1000);
+            expiryTimer = setTimeout(() => { wsKick(ws); }, secsLeft * 1000);
         } else {
-            wsKick(ws); return;
+            wsKick(ws);
+            return;
         }
     }
 
@@ -596,7 +583,7 @@ wss.on('connection', async (ws, req) => {
     let _jobId    = null;
 
     ws.on('pong', () => { ws.isAlive = true; });
-    ws.on('error', err => console.warn('[WS] Socket error:', err.message));
+    ws.on('error', () => {});
 
     ws.on('message', data => {
         let msg;
@@ -604,7 +591,8 @@ wss.on('connection', async (ws, req) => {
         if (!msg || typeof msg !== 'object') return;
 
         if (msg.type === 'presence_join' && msg.username && msg.job_id) {
-            _username = msg.username; _jobId = msg.job_id;
+            _username = msg.username;
+            _jobId    = msg.job_id;
             if (jobPresence[_jobId]) {
                 for (const existing of jobPresence[_jobId]) {
                     if (existing !== _username) {
@@ -616,17 +604,18 @@ wss.on('connection', async (ws, req) => {
             broadcast({ type: 'presence_join', username: _username, job_id: _jobId }, ws);
             return;
         }
+
         broadcast(msg);
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code, reason) => {
         if (expiryTimer) clearTimeout(expiryTimer);
         botLeave(userKey);
         if (_username && _jobId) {
             presenceLeave(_jobId, _username);
             broadcast({ type: 'presence_leave', username: _username, job_id: _jobId }, ws);
         }
-        console.log('[WS] Disconnected:', userKey.slice(0, 8) + '…');
+        console.log('[WS] Disconnected:', userKey.slice(0,8) + '... code=' + code + ' reason=' + (reason?.toString?.() || 'none'));
     });
 });
 
@@ -641,14 +630,13 @@ const heartbeatInterval = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeatInterval));
 
-// ─── WATCHERS ────────────────────────────────────
+// ─── FALLBACK WATCHER ────────────────────────────
 setInterval(() => {
     if (wss.clients.size === 0) return;
     const now = Math.floor(Date.now() / 1000);
     for (const ws of wss.clients) {
         if (ws.readyState !== WebSocket.OPEN) continue;
         if (ws._authExpire !== -1 && ws._authExpire && ws._authExpire <= now) {
-            console.log('[Watcher] Expiry kick:', ws._cerberusKey?.slice(0, 8) + '…');
             wsKick(ws);
         }
     }
@@ -663,7 +651,7 @@ setInterval(async () => {
         if (ws.readyState !== WebSocket.OPEN || !ws._cerberusKey) continue;
         const u     = userMap.get(ws._cerberusKey);
         const valid = u && !u.banned && (u.auth_expire === -1 || u.auth_expire > now);
-        if (!valid) { console.log('[Watcher] Luarmor kick:', ws._cerberusKey?.slice(0, 8) + '…'); wsKick(ws); }
+        if (!valid) wsKick(ws);
         if (u) ws._authExpire = u.auth_expire;
     }
 }, 60_000);
@@ -672,14 +660,14 @@ setInterval(async () => {
 setInterval(() => {
     for (const client of wss.clients) {
         if (client.readyState === WebSocket.OPEN) {
-            try { client.send(PING_BUF); } catch {}
+            try { client.send(PING_STR); } catch {}
         }
     }
 }, 20_000);
 
-// ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════
 //  STARTUP
-// ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════
 function kickLiveSockets(userKey) {
     for (const client of wss.clients) {
         if (client._cerberusKey === userKey && client.readyState === WebSocket.OPEN) {
@@ -689,27 +677,26 @@ function kickLiveSockets(userKey) {
 }
 
 async function rescheduleExpiryTimers() {
-    console.log('[Startup] Re-scheduling expiry timers…');
     const now   = Math.floor(Date.now() / 1000);
     const users = await getAllUsers(true);
     let   count = 0;
     for (const u of users) {
-        if (u.banned || u.auth_expire === -1) continue;
+        if (u.banned) continue;
+        if (u.auth_expire === -1) continue;
         const secsLeft = u.auth_expire - now;
         if (secsLeft <= 0) continue;
         setTimeout(() => {
-            console.log('[Expiry] Timer fired:', u.user_key?.slice(0, 8) + '…');
             kickLiveSockets(u.user_key);
             schedulePanel(500);
         }, secsLeft * 1000);
         count++;
     }
-    console.log(`[Startup] Scheduled ${count} expiry timer(s)`);
+    console.log(`[Cerberus] ${count} expiry timer(s) scheduled`);
 }
 
-// ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════
 //  DISCORD BOT
-// ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════
 let panelMessageId = null;
 let panelDebounce  = null;
 let sequence       = null;
@@ -745,13 +732,11 @@ async function discordRequest(method, path, body) {
             headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' },
             body: body ? JSON.stringify(body) : undefined,
         });
-        if (!res.ok) {
-            const t = await res.text();
-            console.warn(`[Discord] ${method} ${path} failed:`, t.slice(0, 200));
-            return null;
-        }
+        if (!res.ok) return null;
         return res.json();
-    } catch (e) { console.warn(`[Discord] ${method} ${path} threw:`, e.message); return null; }
+    } catch {
+        return null;
+    }
 }
 
 function schedulePanel(delayMs = 1000) {
@@ -787,15 +772,13 @@ async function updatePanel() {
     };
     if (!panelMessageId) {
         const msg = await discordRequest('POST', `/channels/${CHANNEL_ID}/messages`, { embeds: [embed] });
-        if (msg) { panelMessageId = msg.id; console.log('[Panel] Posted:', panelMessageId); }
+        if (msg) panelMessageId = msg.id;
     } else {
         const result = await discordRequest('PATCH', `/channels/${CHANNEL_ID}/messages/${panelMessageId}`, { embeds: [embed] });
         if (!result) {
             panelMessageId = null;
             const msg = await discordRequest('POST', `/channels/${CHANNEL_ID}/messages`, { embeds: [embed] });
-            if (msg) { panelMessageId = msg.id; console.log('[Panel] Re-posted:', panelMessageId); }
-        } else {
-            console.log('[Panel] Updated at', new Date().toLocaleTimeString());
+            if (msg) panelMessageId = msg.id;
         }
     }
 }
@@ -918,7 +901,7 @@ async function handleMessage(msg) {
 
 function startGateway() {
     gatewayWs = new WebSocket('wss://gateway.discord.gg/?v=10&encoding=json');
-    gatewayWs.on('open', () => console.log('[Gateway] Connected'));
+    gatewayWs.on('open', () => {});
     gatewayWs.on('message', async data => {
         let payload;
         try { payload = JSON.parse(data); } catch { return; }
@@ -930,22 +913,27 @@ function startGateway() {
             }, d.heartbeat_interval);
             gatewayWs.send(JSON.stringify({
                 op: 2,
-                d: { token: BOT_TOKEN, intents: 33280, properties: { os: 'linux', browser: 'cerberus', device: 'cerberus' } },
+                d: {
+                    token:      BOT_TOKEN,
+                    intents:    33280,
+                    properties: { os: 'linux', browser: 'cerberus', device: 'cerberus' },
+                },
             }));
         }
         if (op === 0 && t === 'READY') {
-            console.log('[Gateway] Bot ready:', d.user.username);
+            console.log(`[Cerberus] Bot online: ${d.user.username}`);
             await rescheduleExpiryTimers();
             updatePanel();
         }
-        if (op === 0 && t === 'MESSAGE_CREATE') await handleMessage(d);
+        if (op === 0 && t === 'MESSAGE_CREATE') {
+            await handleMessage(d);
+        }
     });
     gatewayWs.on('close', code => {
-        console.warn('[Gateway] Closed:', code, '— reconnecting in 5s');
         clearInterval(heartbeatGW);
         setTimeout(startGateway, 5000);
     });
-    gatewayWs.on('error', err => console.error('[Gateway] Error:', err.message));
+    gatewayWs.on('error', () => {});
 }
 
 startGateway();
