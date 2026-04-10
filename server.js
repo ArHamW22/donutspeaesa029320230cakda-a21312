@@ -66,6 +66,23 @@ if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
 
 app.get('/', (_req, res) => res.send('online'));
 
+// ─── TEST ENDPOINT ───────────────────────────────
+// Visit /test_broadcast in browser to send a fake find to all connected notifiers
+// Use this to confirm messages are reaching the client when scanner isn't running
+app.get('/test_broadcast', (req, res) => {
+    const count = wss.clients.size;
+    broadcast({
+        type:     'brainrot',
+        name:     'TEST PET (debug)',
+        gen:      '999M/s',
+        mutation: 'Rainbow',
+        value:    999000000,
+        job_id:   'test-job-123',
+        place_id: '0',
+    });
+    res.send(`Broadcast sent to ${count} connected client(s). Check your notifier GUI.`);
+});
+
 // ─── GEN RATE PARSER ─────────────────────────────
 function parseGen(raw) {
     if (!raw || raw === '?' || raw === '') return 0;
