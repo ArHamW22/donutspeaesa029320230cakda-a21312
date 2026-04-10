@@ -88,16 +88,38 @@ async function getAllUsers(forceRefresh = false) {
 
 function invalidateUsersCache() { _usersCache = null; _usersCacheAt = 0; }
 
+// ─── KEY VALIDATION CACHE — prevents hammering Luarmor on every reconnect ───
+const _keyValidCache  = new Map();
+const KEY_VALID_TTL   = 60_000; // cache valid result for 60s
+
 async function isKeyValid(key) {
+    const now = Date.now();
+    const cached = _keyValidCache.get(key);
+    if (cached && now - cached.at < KEY_VALID_TTL) return cached.result;
     try {
         const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(key)}`, { headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' } });
-        if (!res.ok) return { valid: false, user: null };
+        if (!res.ok) {
+            // Don't cache failures — let it retry
+            return { valid: false, user: null };
+        }
         const d = await res.json();
-        if (!d.success || !d.users?.length) return { valid: false, user: null };
-        const u = d.users[0]; const now = Math.floor(Date.now() / 1000);
-        if (u.banned) return { valid: false, user: u };
-        if (u.auth_expire !== -1 && u.auth_expire <= now) return { valid: false, user: u };
-        return { valid: true, user: u };
+        if (!d.success || !d.users?.length) {
+            _keyValidCache.set(key, { at: now, result: { valid: false, user: null } });
+            return { valid: false, user: null };
+        }
+        const u = d.users[0];
+        const ts = Math.floor(Date.now() / 1000);
+        if (u.banned) {
+            _keyValidCache.set(key, { at: now, result: { valid: false, user: u } });
+            return { valid: false, user: u };
+        }
+        if (u.auth_expire !== -1 && u.auth_expire <= ts) {
+            _keyValidCache.set(key, { at: now, result: { valid: false, user: u } });
+            return { valid: false, user: u };
+        }
+        const result = { valid: true, user: u };
+        _keyValidCache.set(key, { at: now, result });
+        return result;
     } catch { return { valid: false, user: null }; }
 }
 
@@ -115,7 +137,8 @@ async function createKey(durationSeconds, discordId, label) {
 async function revokeKey(userKey) {
     try {
         const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE', headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' } });
-        if (res.ok) invalidateUsersCache(); return res.ok;
+        if (res.ok) { invalidateUsersCache(); _keyValidCache.delete(userKey); }
+        return res.ok;
     } catch { return false; }
 }
 
@@ -124,11 +147,18 @@ async function getKeyByDiscordId(discordId) {
     return users.find(u => u.discord_id === discordId) || null;
 }
 
-// ─── TOKEN SYSTEM — 120s TTL for slow executors ──
-const TOKEN_TTL = 120_000;
+// ─── TOKEN SYSTEM ────────────────────────────────────────────────
+// TTL raised to 5 minutes — slow executors and reconnect loops
+// need more time between token fetch and WS connect
+const TOKEN_TTL = 300_000;
 const tokens    = new Map();
 
 function generateToken(userKey, user) {
+    // Invalidate any existing tokens for this key first
+    // so multiple reconnect attempts don't stack up stale tokens
+    for (const [tok, entry] of tokens) {
+        if (entry.userKey === userKey) tokens.delete(tok);
+    }
     const token   = crypto.randomBytes(32).toString('hex');
     const expires = Date.now() + TOKEN_TTL;
     tokens.set(token, { userKey, user, expires });
@@ -136,12 +166,21 @@ function generateToken(userKey, user) {
     return token;
 }
 
-function consumeToken(token) {
+// consumeToken now does NOT delete on first use —
+// it only deletes when the WS connection is confirmed open
+// This fixes the loop where token is consumed but WS fails to open
+function peekToken(token) {
     if (!token) return null;
     const entry = tokens.get(token);
     if (!entry) return null;
     if (Date.now() > entry.expires) { tokens.delete(token); return null; }
-    tokens.delete(token); return entry;
+    return entry;
+}
+
+function consumeToken(token) {
+    const entry = peekToken(token);
+    if (entry) tokens.delete(token);
+    return entry;
 }
 
 const serverSubmitTimes = new Map();
@@ -264,10 +303,25 @@ app.post('/bot_leave', (req, res) => {
     botLeave(user_key); res.json({ ok: true });
 });
 
+// ─── GET TOKEN — fixed to handle Luarmor timeouts gracefully ────
 app.get('/get_token', async (req, res) => {
     const userKey = (req.query.user_key || '').trim();
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
-    const { valid, user } = await isKeyValid(userKey);
+
+    // Race Luarmor validation against a 8s timeout
+    // so slow Luarmor responses don't cause the Lua script to timeout
+    let validResult;
+    try {
+        validResult = await Promise.race([
+            isKeyValid(userKey),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8_000))
+        ]);
+    } catch {
+        // Luarmor timed out — return 503 so Lua retries instead of treating as expired
+        return res.status(503).json({ error: 'Validation timeout — retry' });
+    }
+
+    const { valid, user } = validResult;
     if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
     res.json({ token: generateToken(userKey, user) });
 });
@@ -344,22 +398,33 @@ wss.on('connection', async (ws, req) => {
     const qi = rawUrl.indexOf('?');
     if (qi >= 0) try { token = new URLSearchParams(rawUrl.slice(qi + 1)).get('token') || null; } catch {}
     if (!token) { const proto = req.headers['sec-websocket-protocol']; if (proto) token = proto.split(',')[0].trim() || null; }
-    const entry = consumeToken(token);
-    if (!entry) { try { ws.send(EXPIRED_STR); } catch {} ws.terminate(); return; }
+
+    // Use peekToken first — don't consume until connection is confirmed valid
+    const entry = peekToken(token);
+    if (!entry) {
+        try { ws.send(EXPIRED_STR); } catch {}
+        ws.terminate(); return;
+    }
+    // Now consume it — connection is confirmed open
+    tokens.delete(token);
+
     const { userKey, user } = entry;
     ws._cerberusKey = userKey; ws._authExpire = user ? user.auth_expire : null; ws.isAlive = true;
+
     let expiryTimer = null;
     if (user && user.auth_expire !== -1) {
         const secsLeft = user.auth_expire - Math.floor(Date.now() / 1000);
         if (secsLeft > 0) { expiryTimer = setTimeout(() => wsKick(ws), secsLeft * 1000); }
         else { wsKick(ws); return; }
     }
+
     let _username = null, _jobId = null;
     ws.on('pong', () => { ws.isAlive = true; });
     ws.on('error', () => {});
     ws.on('message', data => {
         let msg; try { msg = JSON.parse(data); } catch { return; }
         if (!msg || typeof msg !== 'object') return;
+        if (msg.type === 'ping') { wsSend(ws, { type: 'pong' }); return; }
         if (msg.type === 'presence_join' && msg.username && msg.job_id) {
             _username = msg.username; _jobId = msg.job_id;
             if (jobPresence[_jobId]) for (const existing of jobPresence[_jobId]) if (existing !== _username) wsSend(ws, { type: 'presence_join', username: existing, job_id: _jobId });
@@ -394,7 +459,7 @@ setInterval(async () => {
         const u = userMap.get(ws._cerberusKey);
         const valid = u && !u.banned && (u.auth_expire === -1 || u.auth_expire > now);
         if (!valid) wsKick(ws);
-        if (u) ws._authExpire = u.auth_expire;
+        if (u) { ws._authExpire = u.auth_expire; _keyValidCache.delete(ws._cerberusKey); }
     }
 }, 60_000);
 
