@@ -339,7 +339,8 @@ function broadcastStaggered(pets, basePayload) {
                 ...basePayload,
                 name:     pet.name,
                 gen:      pet.gen || '?',
-                mutation: pet.mutation || 'None',
+                // Pass actual mutation — empty string and 'None' both normalize to 'None'
+                mutation: (pet.mutation && pet.mutation !== '' && pet.mutation !== 'None') ? pet.mutation : 'None',
                 value:    pet.value || 0,
             });
         }, i * 150);
@@ -497,28 +498,38 @@ app.post('/submit_batch', async (req, res) => {
     const bestGen = parseGen(best.gen);
     broadcastStaggered(pets, { type:'brainrot', job_id:b.job_id||'', place_id:b.place_id||'' });
     res.json({ ok: true });
+
     let webhook = null;
-    if      (bestGen >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
-    else if (bestGen >= 400e6) webhook = process.env.WEBHOOK_400_999M;
-    else if (bestGen >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
-    if (webhook) {
+    let tierName = null;
+    if      (bestGen >= 999e6) { webhook = process.env.WEBHOOK_999M_PLUS; tierName = 'Peaklights'; }
+    else if (bestGen >= 400e6) { webhook = process.env.WEBHOOK_400_999M;  tierName = 'Highlights'; }
+    else if (bestGen >= 50e6)  { webhook = process.env.WEBHOOK_50_400M;   tierName = 'Lowlights';  }
+
+    if (webhook && tierName) {
         let imageUrl = b.image_url || null;
         if (!imageUrl) { for (const pet of pets) { imageUrl = await fetchWikiImage(pet.name); if (imageUrl) break; } }
-        const bestMut = best.mutation && best.mutation !== 'None' ? best.mutation : 'Base';
+
+        const bestMut = (best.mutation && best.mutation !== 'None' && best.mutation !== '') ? best.mutation : 'Base';
+
+        // Build description matching reference style
         let desc = `🏆 **Best**\n[${bestMut}] ${best.name} [${displayGen(best.gen)}]`;
         if (pets.length > 1) {
             desc += '\n\n♦ **Others**';
             for (const pet of pets.slice(1)) {
-                const mut = pet.mutation && pet.mutation !== 'None' ? pet.mutation : 'Base';
+                const mut = (pet.mutation && pet.mutation !== 'None' && pet.mutation !== '') ? pet.mutation : 'Base';
                 desc += `\n• [${mut}] ${pet.name} [${displayGen(pet.gen)}]`;
             }
         }
         desc += '\n\n💸 **Buy a Slot!**';
+
         fireWebhook(webhook, {
-            title:'⭐ Cerberus Notifier | Finds', description:desc.slice(0,3900), color:0x9B59B6,
-            thumbnail:imageUrl?{url:imageUrl}:undefined,
-            fields:[{name:'Players',value:b.players?`${b.players}/8`:'Unknown',inline:false}],
-            footer:{text:'Cerberus Notifier • gg/cerberusnotifier'}, timestamp:new Date().toISOString(),
+            title:       `⭐ Cerberus Notifier | ${tierName}`,
+            description: desc.slice(0, 3900),
+            color:       0x9B59B6,
+            thumbnail:   imageUrl ? { url: imageUrl } : undefined,
+            fields:      [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
+            footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
+            timestamp:   new Date().toISOString(),
         });
     }
 });
@@ -529,23 +540,35 @@ app.post('/submit', async (req, res) => {
     if (!b?.name) return res.status(400).json({ error: 'Missing name' });
     const jobId = b.job_id || 'unknown';
     if (isServerRateLimited(jobId)) return res.status(429).json({ error: 'Rate limited' });
-    broadcast({ type:'brainrot', name:b.name, gen:b.gen||'?', mutation:b.mutation||'None',
-                value:b.value||0, job_id:b.job_id||'', place_id:b.place_id||'' });
+    // Pass mutation through explicitly so GUI shows the real mutation
+    broadcast({
+        type:     'brainrot',
+        name:     b.name,
+        gen:      b.gen     || '?',
+        mutation: (b.mutation && b.mutation !== '' && b.mutation !== 'None') ? b.mutation : 'None',
+        value:    b.value   || 0,
+        job_id:   b.job_id  || '',
+        place_id: b.place_id || '',
+    });
     const genVal = parseGen(b.gen);
-    let webhook = null;
-    if      (genVal >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
-    else if (genVal >= 400e6) webhook = process.env.WEBHOOK_400_999M;
-    else if (genVal >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
-    if (webhook) {
+    let webhook  = null;
+    let tierName = null;
+    if      (genVal >= 999e6) { webhook = process.env.WEBHOOK_999M_PLUS; tierName = 'Peaklights'; }
+    else if (genVal >= 400e6) { webhook = process.env.WEBHOOK_400_999M;  tierName = 'Highlights'; }
+    else if (genVal >= 50e6)  { webhook = process.env.WEBHOOK_50_400M;   tierName = 'Lowlights';  }
+
+    if (webhook && tierName) {
         let imageUrl = b.image_url || null;
         if (!imageUrl) imageUrl = await fetchWikiImage(b.name);
-        const mut = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
+        const mut = (b.mutation && b.mutation !== 'None' && b.mutation !== '') ? b.mutation : 'Base';
         fireWebhook(webhook, {
-            title:'⭐ Cerberus Notifier | Find',
-            description:`🏆 **Best**\n[${mut}] ${b.name} [${displayGen(b.gen)}]\n\n💸 **Buy a Slot!**`,
-            color:0x9B59B6, thumbnail:imageUrl?{url:imageUrl}:undefined,
-            fields:[{name:'Players',value:b.players?`${b.players}/8`:'Unknown',inline:false}],
-            footer:{text:'Cerberus Notifier • gg/cerberusnotifier'}, timestamp:new Date().toISOString(),
+            title:       `⭐ Cerberus Notifier | ${tierName}`,
+            description: `🏆 **Best**\n[${mut}] ${b.name} [${displayGen(b.gen)}]\n\n💸 **Buy a Slot!**`,
+            color:       0x9B59B6,
+            thumbnail:   imageUrl ? { url: imageUrl } : undefined,
+            fields:      [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
+            footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
+            timestamp:   new Date().toISOString(),
         });
     }
     res.json({ ok: true });
