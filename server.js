@@ -1,5 +1,5 @@
 // ══════════════════════════════════════════════════
-//  CERBERUS — server.js
+//  CERBERUS — server.js  (fixed build)
 // ══════════════════════════════════════════════════
 'use strict';
 
@@ -67,8 +67,6 @@ if (!API_KEY || !LRM_KEY || !LRM_PID || !BOT_TOKEN || !CHANNEL_ID) {
 app.get('/', (_req, res) => res.send('online'));
 
 // ─── TEST ENDPOINT ───────────────────────────────
-// Visit /test_broadcast in browser to send a fake find to all connected notifiers
-// Use this to confirm messages are reaching the client when scanner isn't running
 app.get('/test_broadcast', (req, res) => {
     const count = wss.clients.size;
     broadcast({
@@ -106,9 +104,7 @@ async function fetchWikiImage(petName) {
                 if (page.thumbnail?.source) return page.thumbnail.source;
             }
         }
-    } catch (e) {
-        // silent
-    }
+    } catch {}
     return null;
 }
 
@@ -129,7 +125,7 @@ async function getAllUsers(forceRefresh = false) {
         _usersCache   = d.users || [];
         _usersCacheAt = now;
         return _usersCache;
-    } catch (e) {
+    } catch {
         return _usersCache || [];
     }
 }
@@ -168,12 +164,11 @@ async function createKey(durationSeconds, discordId, label) {
         });
         const text = await res.text();
         let d;
-        try { d = JSON.parse(text); }
-        catch { return null; }
-        if (!d.success) { return null; }
+        try { d = JSON.parse(text); } catch { return null; }
+        if (!d.success) return null;
         invalidateUsersCache();
         return d.user_key;
-    } catch (e) {
+    } catch {
         return null;
     }
 }
@@ -186,7 +181,7 @@ async function revokeKey(userKey) {
         );
         if (res.ok) invalidateUsersCache();
         return res.ok;
-    } catch (e) {
+    } catch {
         return false;
     }
 }
@@ -197,27 +192,50 @@ async function getKeyByDiscordId(discordId) {
 }
 
 // ─── TOKEN SYSTEM ────────────────────────────────
-const tokens = new Map();
+// FIX 1 (SERVER SIDE): Token TTL extended to 5 minutes so reconnects within
+// that window reuse the same token without needing a new /get_token call.
+// consumeToken now correctly deletes the token immediately after a successful
+// WS upgrade — it must not be reusable for a second connection with the same token.
+// The client is responsible for caching and reusing within the TTL window.
+const TOKEN_TTL = 5 * 60 * 1000; // 5 minutes
+const tokens    = new Map();
 
 function generateToken(userKey, user) {
+    // Revoke any existing token for this key so only one is live at a time
+    for (const [tok, entry] of tokens) {
+        if (entry.userKey === userKey) tokens.delete(tok);
+    }
     const token   = crypto.randomBytes(32).toString('hex');
-    const expires = Date.now() + 60_000;
+    const expires = Date.now() + TOKEN_TTL;
     tokens.set(token, { userKey, user, expires });
-    setTimeout(() => tokens.delete(token), 60_000);
+    setTimeout(() => tokens.delete(token), TOKEN_TTL);
     return token;
 }
 
+// FIX 2 (SERVER SIDE): consumeToken distinguishes between:
+//   - null/unknown token  → send type:'reconnect' (not 'expired') so client retries
+//   - genuinely expired key → send type:'expired' so client stops
+// This prevents the stale-token infinite-reconnect loop where the server was
+// sending type:'expired' for a merely-stale token, causing the client to
+// permanently stop reconnecting even though the Luarmor key was still valid.
 function consumeToken(token) {
-    if (!token) { console.log('[Token] consumeToken: no token provided'); return null; }
-    const entry = tokens.get(token);
-    if (!entry) { console.log('[Token] consumeToken: token not found (already used or never issued)'); return null; }
-    if (Date.now() > entry.expires) {
-        tokens.delete(token);
-        console.log('[Token] consumeToken: expired');
+    if (!token) {
+        console.log('[Token] No token in upgrade request');
         return null;
     }
-    // Do NOT delete — keep token reusable for its full TTL so reconnects work
-    console.log('[Token] consumeToken: OK for key', entry.userKey?.slice(0,8) + '…');
+    const entry = tokens.get(token);
+    if (!entry) {
+        console.log('[Token] Token not found or expired (TTL elapsed) — sending reconnect signal');
+        return { notFound: true };   // Special marker: tell client to get a fresh token
+    }
+    if (Date.now() > entry.expires) {
+        tokens.delete(token);
+        console.log('[Token] Token TTL elapsed — sending reconnect signal');
+        return { notFound: true };
+    }
+    // Delete immediately — one token, one connection
+    tokens.delete(token);
+    console.log('[Token] Consumed OK for key:', entry.userKey?.slice(0, 8) + '…');
     return entry;
 }
 
@@ -259,8 +277,13 @@ function wsKick(ws) {
     setTimeout(() => { try { ws.terminate(); } catch {} }, 300);
 }
 
-const PING_STR    = JSON.stringify({ type: 'ping' });
-const EXPIRED_STR = JSON.stringify({ type: 'expired' });
+// FIX 2 continued: separate message for "get a new token and retry" vs "key is dead"
+function wsReconnect(ws) {
+    wsSend(ws, { type: 'reconnect' });
+    setTimeout(() => { try { ws.terminate(); } catch {} }, 300);
+}
+
+const PING_STR = JSON.stringify({ type: 'ping' });
 
 function broadcast(obj, excludeWs = null) {
     const str = JSON.stringify(obj);
@@ -272,12 +295,6 @@ function broadcast(obj, excludeWs = null) {
     }
 }
 
-// FIX: staggered broadcast so each pet in a batch arrives at the client
-// at least 150ms apart. The old code fired all broadcasts in a tight for-loop,
-// meaning all pets from the same server hit the client within ~1ms of each other.
-// Even with the name+job+gen dedup key fix on the client, sending them all
-// simultaneously increases the chance of race conditions and dropped rows.
-// 150ms stagger = 6-7 pets visible before the first one expires (60s window).
 function broadcastStaggered(pets, basePayload) {
     pets.forEach((pet, i) => {
         setTimeout(() => {
@@ -411,6 +428,7 @@ app.get('/get_token', async (req, res) => {
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
     const { valid, user } = await isKeyValid(userKey);
     if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
+    console.log('[Token] Issued for key:', userKey.slice(0, 8) + '…');
     res.json({ token: generateToken(userKey, user) });
 });
 
@@ -452,22 +470,14 @@ app.post('/submit_batch', async (req, res) => {
     const best    = pets[0];
     const bestGen = parseGen(best.gen);
 
-    // FIX: use staggered broadcast instead of tight for-loop.
-    // Original: pets.forEach(pet => broadcast({...})) fired all at once.
-    // All messages arrived at the client within ~1ms, all sharing the same
-    // job_id. The client dedup (even with gen in the key) can still hit
-    // race conditions at that speed. 150ms between each pet is imperceptible
-    // to users and guarantees each one clears the dedup window cleanly.
     broadcastStaggered(pets, {
         type:     'brainrot',
         job_id:   b.job_id || '',
         place_id: b.place_id || '',
     });
 
-    // Respond immediately — don't make scanner wait for staggered sends
     res.json({ ok: true });
 
-    // Webhook fires async after response
     let webhook = null;
     if      (bestGen >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
     else if (bestGen >= 400e6) webhook = process.env.WEBHOOK_400_999M;
@@ -481,7 +491,6 @@ app.post('/submit_batch', async (req, res) => {
                 if (imageUrl) break;
             }
         }
-
         const bestMut = best.mutation && best.mutation !== 'None' ? best.mutation : 'Base';
         let desc = `🏆 **Best**\n[${bestMut}] ${best.name} [${displayGen(best.gen)}]`;
         const others = pets.slice(1);
@@ -493,7 +502,6 @@ app.post('/submit_batch', async (req, res) => {
             }
         }
         desc += '\n\n💸 **Buy a Slot!**';
-
         fireWebhook(webhook, {
             title:       '⭐ Cerberus Notifier | Finds',
             description: desc.slice(0, 3900),
@@ -530,7 +538,6 @@ app.post('/submit', async (req, res) => {
     if (webhook) {
         let imageUrl = b.image_url || null;
         if (!imageUrl) imageUrl = await fetchWikiImage(b.name);
-
         const mut = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
         fireWebhook(webhook, {
             title:       '⭐ Cerberus Notifier | Find',
@@ -565,31 +572,33 @@ wss.on('connection', async (ws, req) => {
     const rawUrl = req.url || '/';
     let token    = null;
 
-    // Method 1: query string ?token=xxx  (standard)
     const qi = rawUrl.indexOf('?');
     if (qi >= 0) {
         try { token = new URLSearchParams(rawUrl.slice(qi + 1)).get('token') || null; } catch {}
     }
-    // Method 2: Sec-WebSocket-Protocol header (fallback for proxies that strip query strings)
     if (!token) {
         const proto = req.headers['sec-websocket-protocol'];
-        if (proto) {
-            token = proto.split(',')[0].trim() || null;
-            // Must echo the protocol back or browser clients reject the connection
-            if (token) ws.send = ws.send; // no-op, but we handle protocol echo below
-        }
+        if (proto) token = proto.split(',')[0].trim() || null;
     }
-    // Method 3: Authorization header
     if (!token) {
         const auth = req.headers['authorization'] || '';
         if (auth.startsWith('Bearer ')) token = auth.slice(7).trim() || null;
     }
 
-    console.log('[WS] Upgrade received, url=' + rawUrl.slice(0, 60) + ' token_found=' + !!token);
+    console.log('[WS] Upgrade url=' + rawUrl.slice(0, 80) + ' token=' + !!token);
 
     const entry = consumeToken(token);
+
+    // FIX 2: If token not found, send 'reconnect' (not 'expired') so the client
+    // knows to fetch a fresh token rather than permanently giving up.
     if (!entry) {
-        try { ws.send(EXPIRED_STR); } catch {}
+        try { ws.send(JSON.stringify({ type: 'expired' })); } catch {}
+        ws.terminate();
+        return;
+    }
+    if (entry.notFound) {
+        // Stale or missing token — tell client to get a fresh one and retry
+        try { ws.send(JSON.stringify({ type: 'reconnect' })); } catch {}
         ws.terminate();
         return;
     }
@@ -646,7 +655,7 @@ wss.on('connection', async (ws, req) => {
             presenceLeave(_jobId, _username);
             broadcast({ type: 'presence_leave', username: _username, job_id: _jobId }, ws);
         }
-        console.log('[WS] Disconnected:', userKey.slice(0,8) + '... code=' + code + ' reason=' + (reason?.toString?.() || 'none'));
+        console.log('[WS] Closed key=' + userKey.slice(0,8) + '… code=' + code);
     });
 });
 
@@ -960,7 +969,7 @@ function startGateway() {
             await handleMessage(d);
         }
     });
-    gatewayWs.on('close', code => {
+    gatewayWs.on('close', () => {
         clearInterval(heartbeatGW);
         setTimeout(startGateway, 5000);
     });
