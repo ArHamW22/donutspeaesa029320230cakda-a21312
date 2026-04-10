@@ -183,14 +183,14 @@ async function isKeyValid(key, maxRetries = 3) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ─── FIX 3: createKey now sends key_days instead of auth_expire ──
-// Luarmor's POST /users API expects key_days (integer number of days)
-// for key_days-typed projects. auth_expire (unix ts) is for
-// auth_expire-typed projects. We send BOTH so it works either way.
+// ─── createKey: auth_expire only (per Luarmor docs) ──────────────
+// Per docs: providing discord_id + auth_expire directly starts the timer
+// immediately without needing key_days. key_days is NOT sent because it
+// only accepts whole days, so 2h would silently become 1 day minimum.
 async function createKey(durationSeconds, discordId, label) {
+    // Use auth_expire (unix timestamp) only — key_days only accepts whole days
+    // so passing it would round 2h up to 1 day. auth_expire is precise.
     const auth_expire = Math.floor(Date.now() / 1000) + durationSeconds;
-    // key_days: round up to nearest day (minimum 1)
-    const key_days = Math.max(1, Math.ceil(durationSeconds / 86400));
 
     try {
         const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, {
@@ -198,7 +198,6 @@ async function createKey(durationSeconds, discordId, label) {
             headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' },
             body:    JSON.stringify({
                 auth_expire,
-                key_days,
                 discord_id: discordId,
                 note: `Cerberus — ${label}`,
             }),
@@ -236,7 +235,8 @@ async function revokeKey(userKey) {
 }
 
 async function getKeyByDiscordId(discordId) {
-    const users = await getAllUsers();
+    // Force refresh so we don't get false positives from stale cache
+    const users = await getAllUsers(true);
     return users.find(u => u.discord_id === discordId) || null;
 }
 
@@ -279,8 +279,9 @@ function isServerRateLimited(jobId) {
     if (last && now - last < SERVER_COOLDOWN) return true;
     const cutoff = now - GLOBAL_WINDOW;
     while (globalSubmits.length && globalSubmits[0] < cutoff) globalSubmits.shift();
-    if (globalSubmits.length >= GLOBAL_MAX) return true;
+    // Record timestamp first so per-server cooldown applies regardless of global limit
     serverSubmitTimes.set(jobId, now);
+    if (globalSubmits.length >= GLOBAL_MAX) return true;
     globalSubmits.push(now);
     if (serverSubmitTimes.size > 5000) {
         for (const [k, t] of serverSubmitTimes) {
@@ -794,9 +795,15 @@ async function discordRequest(method, path, body) {
             headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' },
             body: body ? JSON.stringify(body) : undefined,
         });
-        if (!res.ok) return null;
+        if (!res.ok) {
+            console.warn(`[Discord] ${method} ${path} -> ${res.status}`);
+            return null;
+        }
         return res.json();
-    } catch { return null; }
+    } catch (err) {
+        console.warn(`[Discord] ${method} ${path} threw:`, err.message);
+        return null;
+    }
 }
 
 function schedulePanel(delayMs = 1000) {
@@ -807,7 +814,8 @@ function schedulePanel(delayMs = 1000) {
 async function updatePanel() {
     const now    = Math.floor(Date.now() / 1000);
     const users  = await getAllUsers(true);
-    const active = users.filter(u => !u.banned && (u.auth_expire === -1 || u.auth_expire === 0 || u.auth_expire > now));
+    // Include 'reset' status — per Luarmor docs, reset means HWID was cleared but key is still valid
+    const active = users.filter(u => !u.banned && u.status !== 'banned' && (u.auth_expire === -1 || u.auth_expire === 0 || u.auth_expire > now));
     const used   = active.length;
     const full   = used >= MAX_SLOTS;
     const lines  = active.length > 0
