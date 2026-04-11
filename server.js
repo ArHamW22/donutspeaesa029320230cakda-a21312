@@ -71,6 +71,7 @@ async function fetchWikiImage(petName) {
     return null;
 }
 
+// ─── USER CACHE ───────────────────────────────────
 let _usersCache = null, _usersCacheAt = 0;
 const USERS_TTL = 30_000;
 
@@ -81,6 +82,12 @@ async function getAllUsers(forceRefresh = false) {
         const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users`, { headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' } });
         if (!res.ok) return _usersCache || [];
         const d = await res.json();
+        // also warm the per-key cache from the bulk response
+        const nowSec = Math.floor(Date.now() / 1000);
+        for (const u of (d.users || [])) {
+            const valid = !u.banned && (u.auth_expire === -1 || u.auth_expire > nowSec);
+            keyValidCache.set(u.user_key, { valid, user: u, cachedAt: Date.now() });
+        }
         _usersCache = d.users || []; _usersCacheAt = now;
         return _usersCache;
     } catch { return _usersCache || []; }
@@ -89,12 +96,12 @@ async function getAllUsers(forceRefresh = false) {
 function invalidateUsersCache() {
     _usersCache = null;
     _usersCacheAt = 0;
-    keyValidCache.clear(); // also clear per-key cache
+    keyValidCache.clear();
 }
 
-// ─── FIX 1: per-key validation cache so /get_token responds in <5ms ───────────
+// ─── PER-KEY VALIDATION CACHE (makes /get_token <5ms) ─────────────────────────
 const keyValidCache = new Map();
-const KEY_VALID_TTL = 60_000; // 60 seconds
+const KEY_VALID_TTL = 60_000;
 
 async function isKeyValid(key) {
     const now = Date.now();
@@ -110,12 +117,22 @@ async function isKeyValid(key) {
             keyValidCache.set(key, { valid: false, user: null, cachedAt: now });
             return { valid: false, user: null };
         }
-        const u = d.users[0]; const nowSec = Math.floor(now / 1000);
+        const u = d.users[0];
+        const nowSec = Math.floor(now / 1000);
         const valid = !u.banned && (u.auth_expire === -1 || u.auth_expire > nowSec);
         keyValidCache.set(key, { valid, user: u, cachedAt: now });
         return { valid, user: u };
     } catch { return { valid: false, user: null }; }
 }
+
+// warm all keys on startup so first /get_token is instant for everyone
+getAllUsers(true).then(() => console.log('[Cerberus] Key cache warmed'));
+
+// periodically evict stale per-key cache entries
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of keyValidCache) if (now - v.cachedAt > KEY_VALID_TTL) keyValidCache.delete(k);
+}, 120_000);
 
 async function createKey(durationSeconds, discordId, label) {
     const auth_expire = Math.floor(Date.now() / 1000) + durationSeconds;
@@ -131,10 +148,7 @@ async function createKey(durationSeconds, discordId, label) {
 async function revokeKey(userKey) {
     try {
         const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE', headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' } });
-        if (res.ok) {
-            invalidateUsersCache();
-            keyValidCache.delete(userKey); // immediately evict this key
-        }
+        if (res.ok) { invalidateUsersCache(); keyValidCache.delete(userKey); }
         return res.ok;
     } catch { return false; }
 }
@@ -145,11 +159,10 @@ async function getKeyByDiscordId(discordId) {
 }
 
 // ─── TOKEN SYSTEM ─────────────────────────────────
-const TOKEN_TTL = 300_000; // 5 minutes
+const TOKEN_TTL = 300_000;
 const tokens    = new Map();
 
 function generateToken(userKey, user) {
-    // Reuse existing valid token for this key if one exists
     for (const [tok, entry] of tokens) {
         if (entry.userKey === userKey && Date.now() < entry.expires) {
             entry.expires = Date.now() + TOKEN_TTL;
@@ -168,9 +181,10 @@ function consumeToken(token) {
     const entry = tokens.get(token);
     if (!entry) return null;
     if (Date.now() > entry.expires) { tokens.delete(token); return null; }
-    return entry; // reusable within TTL
+    return entry;
 }
 
+// ─── RATE LIMITING ────────────────────────────────
 const serverSubmitTimes = new Map();
 const globalSubmits     = [];
 const SERVER_COOLDOWN   = 10_000;
@@ -202,14 +216,13 @@ function wsKick(ws) {
 const PING_STR    = JSON.stringify({ type: 'ping' });
 const EXPIRED_STR = JSON.stringify({ type: 'expired' });
 
-// ─── FIX 2: recent broadcast buffer so late-connecting clients catch up ────────
+// ─── REPLAY BUFFER (late-joining clients catch missed finds) ──────────────────
 const recentBroadcasts = [];
 const MAX_RECENT       = 20;
-const RECENT_TTL       = 120_000; // 2 minutes
+const RECENT_TTL       = 120_000;
 
 function broadcast(obj, excludeWs = null) {
     const str = JSON.stringify(obj);
-    // buffer brainrot events so new connections can replay them
     if (obj.type === 'brainrot') {
         recentBroadcasts.push({ str, at: Date.now() });
         if (recentBroadcasts.length > MAX_RECENT) recentBroadcasts.shift();
@@ -231,20 +244,8 @@ function fireWebhook(webhook, embedData) {
 }
 
 const botJobMap = new Map(), botCurrent = new Map();
-
-function botJoin(userKey, jobId) {
-    botLeave(userKey); botCurrent.set(userKey, jobId);
-    if (!botJobMap.has(jobId)) botJobMap.set(jobId, new Set());
-    botJobMap.get(jobId).add(userKey);
-}
-
-function botLeave(userKey) {
-    const oldJob = botCurrent.get(userKey); if (!oldJob) return;
-    botCurrent.delete(userKey);
-    const set = botJobMap.get(oldJob);
-    if (set) { set.delete(userKey); if (set.size === 0) botJobMap.delete(oldJob); }
-}
-
+function botJoin(userKey, jobId) { botLeave(userKey); botCurrent.set(userKey, jobId); if (!botJobMap.has(jobId)) botJobMap.set(jobId, new Set()); botJobMap.get(jobId).add(userKey); }
+function botLeave(userKey) { const oldJob = botCurrent.get(userKey); if (!oldJob) return; botCurrent.delete(userKey); const set = botJobMap.get(oldJob); if (set) { set.delete(userKey); if (set.size === 0) botJobMap.delete(oldJob); } }
 function isJobOccupied(jobId) { const set = botJobMap.get(jobId); return set && set.size > 0; }
 
 async function getNextServerFromFetcher(requestingUserKey) {
@@ -301,6 +302,7 @@ app.post('/bot_leave', (req, res) => {
     botLeave(user_key); res.json({ ok: true });
 });
 
+// accepts key from query param OR header
 app.get('/get_token', async (req, res) => {
     const userKey = (req.query.user_key || req.headers['x-api-key'] || '').trim();
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
@@ -372,10 +374,12 @@ app.post('/submit', async (req, res) => {
     });
 });
 
+// ─── PRESENCE ─────────────────────────────────────
 const jobPresence = {};
 function presenceJoin(jobId, username) { if (!jobPresence[jobId]) jobPresence[jobId] = new Set(); jobPresence[jobId].add(username); }
 function presenceLeave(jobId, username) { if (!jobPresence[jobId]) return; jobPresence[jobId].delete(username); if (jobPresence[jobId].size === 0) delete jobPresence[jobId]; }
 
+// ─── WEBSOCKET ────────────────────────────────────
 wss.on('connection', async (ws, req) => {
     const rawUrl = req.url || '/'; let token = null;
     const qi = rawUrl.indexOf('?');
@@ -396,10 +400,10 @@ wss.on('connection', async (ws, req) => {
 
     console.log(`[WS] Connected: ${userKey.slice(0,8)}...`);
 
-    // ── FIX 2: replay recent brainrot broadcasts to this new connection ──────
-    const now = Date.now();
+    // replay recent finds so late-connecting clients don't miss anything
+    const nowMs = Date.now();
     for (const recent of recentBroadcasts) {
-        if (now - recent.at < RECENT_TTL) {
+        if (nowMs - recent.at < RECENT_TTL) {
             try { ws.send(recent.str); } catch {}
         }
     }
@@ -407,11 +411,8 @@ wss.on('connection', async (ws, req) => {
     let expiryTimer = null;
     if (user && user.auth_expire !== -1) {
         const secsLeft = user.auth_expire - Math.floor(Date.now() / 1000);
-        if (secsLeft > 0) {
-            expiryTimer = setTimeout(() => wsKick(ws), secsLeft * 1000);
-        } else {
-            wsKick(ws); return;
-        }
+        if (secsLeft > 0) { expiryTimer = setTimeout(() => wsKick(ws), secsLeft * 1000); }
+        else { wsKick(ws); return; }
     }
 
     let _username = null, _jobId = null;
@@ -434,18 +435,14 @@ wss.on('connection', async (ws, req) => {
         console.log(`[WS] Disconnected: ${userKey.slice(0,8)}... code=${code}`);
         if (expiryTimer) clearTimeout(expiryTimer);
         botLeave(userKey);
-        if (_username && _jobId) {
-            presenceLeave(_jobId, _username);
-            broadcast({ type: 'presence_leave', username: _username, job_id: _jobId }, ws);
-        }
+        if (_username && _jobId) { presenceLeave(_jobId, _username); broadcast({ type: 'presence_leave', username: _username, job_id: _jobId }, ws); }
     });
 });
 
 const heartbeatInterval = setInterval(() => {
     for (const ws of wss.clients) {
         if (!ws.isAlive) { ws.terminate(); continue; }
-        ws.isAlive = false;
-        try { ws.ping(); } catch {}
+        ws.isAlive = false; try { ws.ping(); } catch {}
     }
 }, 30_000);
 wss.on('close', () => clearInterval(heartbeatInterval));
@@ -479,14 +476,7 @@ setInterval(() => {
     }
 }, 20_000);
 
-// periodically evict stale key cache entries
-setInterval(() => {
-    const now = Date.now();
-    for (const [k, v] of keyValidCache) {
-        if (now - v.cachedAt > KEY_VALID_TTL) keyValidCache.delete(k);
-    }
-}, 120_000);
-
+// ─── DISCORD BOT ──────────────────────────────────
 let panelMessageId = null, panelDebounce = null, sequence = null, heartbeatGW, gatewayWs;
 
 function parseDuration(str) {
