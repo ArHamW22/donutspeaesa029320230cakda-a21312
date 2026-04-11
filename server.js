@@ -49,15 +49,16 @@ async function luarmorFetch(url, options = {}) {
 }
 
 // ─── ENV ─────────────────────────────────────────
-const API_KEY    = process.env.API_KEY;
-const LRM_KEY    = process.env.LRM_KEY;
-const LRM_PID    = process.env.LRM_PID;
-const BOT_TOKEN  = process.env.BOT_TOKEN;
-const CHANNEL_ID = process.env.CHANNEL_ID;
+const API_KEY     = process.env.API_KEY;
+const LRM_KEY     = process.env.LRM_KEY;
+const LRM_PID     = process.env.LRM_PID;
+const BOT_TOKEN   = process.env.BOT_TOKEN;
+const CHANNEL_ID  = process.env.CHANNEL_ID;
 const FETCHER_URL = process.env.FETCHER_URL || 'http://82.11.247.18:5000';
-const MAX_SLOTS  = 7;
-const LOGO_URL   = 'https://media.discordapp.net/attachments/1487763701040680971/1489669239202644089/image.png';
-const ADMIN_IDS  = new Set(['1405960794503647324']);
+const PING_ROLE_ID = process.env.PING_ROLE_ID || '';
+const MAX_SLOTS   = 7;
+const LOGO_URL    = 'https://media.discordapp.net/attachments/1487763701040680971/1489669239202644089/image.png';
+const ADMIN_IDS   = new Set(['1405960794503647324']);
 
 console.log('[ENV] API_KEY set:',    !!API_KEY);
 console.log('[ENV] LRM_KEY set:',    !!LRM_KEY);
@@ -65,6 +66,7 @@ console.log('[ENV] LRM_PID:',         LRM_PID);
 console.log('[ENV] BOT_TOKEN set:',  !!BOT_TOKEN);
 console.log('[ENV] CHANNEL_ID:',      CHANNEL_ID);
 console.log('[ENV] FETCHER_URL:',     FETCHER_URL);
+console.log('[ENV] PING_ROLE_ID:',    PING_ROLE_ID || '(not set)');
 if (!process.env.WEBHOOK_50_400M)    console.warn('[ENV] WARNING: WEBHOOK_50_400M not set');
 if (!process.env.WEBHOOK_400_999M)   console.warn('[ENV] WARNING: WEBHOOK_400_999M not set');
 if (!process.env.WEBHOOK_999M_PLUS)  console.warn('[ENV] WARNING: WEBHOOK_999M_PLUS not set');
@@ -74,9 +76,40 @@ if (!API_KEY || !LRM_KEY || !LRM_PID) {
     console.error('[ENV] Missing required env vars (API_KEY, LRM_KEY, LRM_PID) — exiting');
     process.exit(1);
 }
-if (!BOT_TOKEN || !CHANNEL_ID) console.warn('[ENV] BOT_TOKEN/CHANNEL_ID not set — Discord bot disabled');
+if (!BOT_TOKEN || !CHANNEL_ID) {
+    console.warn('[ENV] BOT_TOKEN/CHANNEL_ID not set — Discord bot disabled');
+}
 
 app.get('/', (_req, res) => res.send('online'));
+
+// ─── GEN / VALUE PARSER ──────────────────────────
+function parseNum(raw) {
+    if (!raw || raw === '?' || raw === '') return 0;
+    const s = String(raw).toLowerCase().replace(/[\$,\s%]/g, '').replace(/\/s$/, '');
+    const n = parseFloat(s.match(/-?\d+\.?\d*/)?.[0] || '0') || 0;
+    if (s.includes('b')) return n * 1e9;
+    if (s.includes('m')) return n * 1e6;
+    if (s.includes('k')) return n * 1e3;
+    return n;
+}
+
+// ─── WIKI IMAGE (server-side fallback) ───────────
+async function fetchWikiImage(petName) {
+    try {
+        const encoded = encodeURIComponent(String(petName).replace(/ /g, '_'));
+        const url = `https://stealabrainrot.fandom.com/api.php?action=query&prop=pageimages&format=json&piprop=thumbnail&pithumbsize=500&titles=${encoded}`;
+        const res = await axios.get(url, { timeout: 8_000 });
+        const pages = res.data?.query?.pages;
+        if (pages) {
+            for (const page of Object.values(pages)) {
+                if (page.thumbnail?.source) return page.thumbnail.source;
+            }
+        }
+    } catch (e) {
+        console.warn('[Wiki] fetch failed for', petName, ':', e.message);
+    }
+    return null;
+}
 
 // ─── LUARMOR — CACHED USER LIST ──────────────────
 let _usersCache   = null;
@@ -166,11 +199,10 @@ async function getKeyByDiscordId(discordId) {
 }
 
 // ─── TOKEN SYSTEM ────────────────────────────────
-const TOKEN_TTL = 300_000; // 5 minutes — allows reconnects without refetching
+const TOKEN_TTL = 300_000; // 5 minutes
 const tokens    = new Map();
 
 function generateToken(userKey, user) {
-    // Reuse existing valid token for this key if one exists
     for (const [tok, entry] of tokens) {
         if (entry.userKey === userKey && Date.now() < entry.expires) {
             entry.expires = Date.now() + TOKEN_TTL;
@@ -184,43 +216,30 @@ function generateToken(userKey, user) {
     return token;
 }
 
-// ✅ NOT deleted on use — reusable for full 5min TTL
-// Lua client caches this and reconnects without re-fetching
 function consumeToken(token) {
     if (!token) return null;
     const entry = tokens.get(token);
     if (!entry) return null;
     if (Date.now() > entry.expires) { tokens.delete(token); return null; }
-    return entry; // intentionally not deleted
+    return entry; // not deleted — reusable for 5min
 }
 
 // ─── RATE LIMITING ───────────────────────────────
-// ✅ Rate limit per job+pet combo so ALL pets from a scan get through.
-//    Same pet from the same job is blocked for 30s to prevent spam.
-const petSubmitTimes = new Map();
-const globalSubmits  = [];
-const PET_COOLDOWN   = 30_000;
-const GLOBAL_MAX     = 200;
-const GLOBAL_WINDOW  = 3_600_000;
+// Global cap only — no per-pet/per-server cooldown.
+// Scanner hops immediately so duplicate submissions never happen naturally.
+const globalSubmits = [];
+const GLOBAL_MAX    = 500;
+const GLOBAL_WINDOW = 3_600_000;
 
-function isRateLimited(jobId, petName) {
-    const now  = Date.now();
-    const key  = jobId + '|' + (petName || '');
-    const last = petSubmitTimes.get(key);
-    if (last && now - last < PET_COOLDOWN) return true;
-
+function isRateLimited() {
+    const now    = Date.now();
     const cutoff = now - GLOBAL_WINDOW;
     while (globalSubmits.length && globalSubmits[0] < cutoff) globalSubmits.shift();
-    if (globalSubmits.length >= GLOBAL_MAX) return true;
-
-    petSubmitTimes.set(key, now);
-    globalSubmits.push(now);
-
-    if (petSubmitTimes.size > 5000) {
-        for (const [k, t] of petSubmitTimes) {
-            if (now - t > PET_COOLDOWN * 2) petSubmitTimes.delete(k);
-        }
+    if (globalSubmits.length >= GLOBAL_MAX) {
+        console.log('[RateLimit] Global cap hit');
+        return true;
     }
+    globalSubmits.push(now);
     return false;
 }
 
@@ -249,30 +268,22 @@ function broadcast(obj, excludeWs = null) {
 }
 
 // ─── WEBHOOK ─────────────────────────────────────
-function formatPrice(v) {
-    const n = parseFloat(v) || 0;
-    if (n >= 1e9) return '$' + (n / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
-    if (n >= 1e6) return '$' + (n / 1e6).toFixed(1).replace(/\.?0+$/, '') + 'M';
-    if (n >= 1e3) return '$' + (n / 1e3).toFixed(1).replace(/\.?0+$/, '') + 'K';
-    return '$' + String(n);
-}
-
 function displayGen(gen) {
     if (!gen || gen === '?') return '?';
     return String(gen);
 }
 
-function fireWebhook(webhook, embedData) {
-    fetch(webhook, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ embeds: [embedData] }),
-    }).catch(e => console.warn('[Webhook] Failed:', e.message));
+async function fireWebhook(webhookUrl, embedData, content = '') {
+    try {
+        await axios.post(webhookUrl, { content, embeds: [embedData] }, { timeout: 8_000 });
+    } catch (e) {
+        console.warn('[Webhook] Failed:', e.message);
+    }
 }
 
-// ══════════════════════════════════════════════════
+// ──────────────────────────────────────────────────
 //  BOT JOB TRACKING
-// ══════════════════════════════════════════════════
+// ──────────────────────────────────────────────────
 const botJobMap  = new Map();
 const botCurrent = new Map();
 
@@ -281,7 +292,7 @@ function botJoin(userKey, jobId) {
     botCurrent.set(userKey, jobId);
     if (!botJobMap.has(jobId)) botJobMap.set(jobId, new Set());
     botJobMap.get(jobId).add(userKey);
-    console.log(`[BotTrack] ${userKey.slice(0,8)}… joined ${jobId} | occupied: ${botJobMap.size} servers`);
+    console.log(`[BotTrack] ${userKey.slice(0,8)}… joined ${jobId}`);
 }
 
 function botLeave(userKey) {
@@ -308,35 +319,31 @@ async function getNextServerFromFetcher(requestingUserKey) {
             const res = await axios.get(`${FETCHER_URL}/next_server`, { timeout: 8_000 });
             data = res.data;
         } catch (e) {
-            console.warn('[Fetcher proxy] Error:', e.message);
+            console.warn('[Fetcher] Error:', e.message);
             return null;
         }
         if (!data || data.error || !data.job_id) return null;
         const jobId = data.job_id;
         if (!isJobOccupied(jobId)) {
-            console.log(`[Fetcher proxy] Giving ${jobId} to ${requestingUserKey.slice(0,8)}… (skipped ${skipped.length})`);
+            console.log(`[Fetcher] Giving ${jobId} to ${requestingUserKey.slice(0,8)}… (skipped ${skipped.length})`);
             return jobId;
         }
-        console.log(`[Fetcher proxy] ${jobId} occupied — skipping`);
         skipped.push(jobId);
-        try {
-            await axios.post(`${FETCHER_URL}/visited`, { job_id: jobId }, { timeout: 4_000 });
-        } catch {}
+        try { await axios.post(`${FETCHER_URL}/visited`, { job_id: jobId }, { timeout: 4_000 }); } catch {}
     }
-    console.warn('[Fetcher proxy] Could not find unoccupied server after 10 attempts');
+    console.warn('[Fetcher] No unoccupied server after 10 attempts');
     return null;
 }
 
-// ══════════════════════════════════════════════════
+// ──────────────────────────────────────────────────
 //  SCAN COORDINATION
-// ══════════════════════════════════════════════════
+// ──────────────────────────────────────────────────
 const hopApproved = new Set();
 
 app.post('/scan_done', (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const { job_id, found_count, players } = req.body || {};
     if (!job_id) return res.status(400).json({ error: 'Missing job_id' });
-    console.log(`[Scan] job=${job_id} found=${found_count ?? 0} players=${players ?? '?'}`);
     broadcast({ type: 'scan_result', job_id, found_count: found_count ?? 0, players: players ?? 0 });
     hopApproved.add(job_id);
     setTimeout(() => hopApproved.delete(job_id), 300_000);
@@ -347,10 +354,7 @@ app.get('/should_hop', (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const jobId = (req.query.job_id || '').trim();
     if (!jobId) return res.status(400).json({ error: 'Missing job_id' });
-    if (hopApproved.has(jobId)) {
-        hopApproved.delete(jobId);
-        return res.json({ hop: true });
-    }
+    if (hopApproved.has(jobId)) { hopApproved.delete(jobId); return res.json({ hop: true }); }
     res.json({ hop: false });
 });
 
@@ -366,7 +370,7 @@ app.get('/next_server', async (req, res) => {
 app.post('/bot_join', (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const { job_id, user_key } = req.body || {};
-    if (!job_id || !user_key) return res.status(400).json({ error: 'Missing job_id or user_key' });
+    if (!job_id || !user_key) return res.status(400).json({ error: 'Missing fields' });
     botJoin(user_key, job_id);
     res.json({ ok: true });
 });
@@ -403,7 +407,7 @@ app.post('/log_execute', async (req, res) => {
     if (webhook) {
         fireWebhook(webhook, {
             title:  '🎮 Cerberus Execution',
-            color:  3066993,
+            color:  0x9B59B6,
             fields: [
                 { name: 'Roblox Username', value: String(username),      inline: true },
                 { name: 'User ID',         value: String(userId || '?'), inline: true },
@@ -414,130 +418,147 @@ app.post('/log_execute', async (req, res) => {
     res.json({ ok: true });
 });
 
-// ── /submit_batch ─────────────────────────────────
-// ─── /aj_users — active slot holders for the GUI ─────────────────────────────
 app.get('/aj_users', async (req, res) => {
     const userKey = (req.query.user_key || req.headers['x-api-key'] || '').trim();
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
     const { valid } = await isKeyValid(userKey);
     if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
-    const now = Math.floor(Date.now() / 1000);
+    const now      = Math.floor(Date.now() / 1000);
     const allUsers = await getAllUsers();
-    const active = allUsers.filter(u => !u.banned && (u.auth_expire === -1 || u.auth_expire > now));
-    const users = active.map(u => ({
-        user_key:   u.user_key ? u.user_key.slice(0, 8) + '…' : '?',
-        discord_id: u.discord_id || null,
-        secs_left:  u.auth_expire === -1 ? -1 : u.auth_expire - now,
-        note:       u.note || '',
-        username:   u.note ? u.note.replace('Cerberus — ', '').split(' ')[0] : null,
-        userId:     null, // Roblox user ID not stored in Luarmor
-    }));
-    res.json({ users });
+    const active   = allUsers.filter(u => !u.banned && (u.auth_expire === -1 || u.auth_expire > now));
+    res.json({
+        users: active.map(u => ({
+            user_key:   u.user_key ? u.user_key.slice(0, 8) + '…' : '?',
+            discord_id: u.discord_id || null,
+            secs_left:  u.auth_expire === -1 ? -1 : u.auth_expire - now,
+            note:       u.note || '',
+        })),
+    });
 });
 
-app.post('/submit_batch', (req, res) => {
+// ── /submit_batch ─────────────────────────────────
+app.post('/submit_batch', async (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const b = req.body;
     if (!b?.pets || !Array.isArray(b.pets) || b.pets.length === 0)
         return res.status(400).json({ error: 'Missing pets array' });
-    const jobId = b.job_id || 'unknown';
 
-    const pets    = [...b.pets].sort((a, bb) => (bb.value || 0) - (a.value || 0));
+    if (isRateLimited()) return res.status(429).json({ error: 'Global rate limit hit' });
+
+    const pets    = [...b.pets].sort((a, bb) => parseNum(bb.gen) - parseNum(a.gen));
     const best    = pets[0];
-    const bestVal = parseFloat(String(best.value || 0));
+    const bestVal = parseNum(best.gen);
 
-    // ✅ Filter out rate-limited pets individually
-    const allowed = pets.filter(pet => !isRateLimited(jobId, pet.name));
-    if (allowed.length === 0) return res.status(429).json({ error: 'Rate limited' });
+    console.log(`[Batch] ${pets.length} pets | best=${best.name} val=${bestVal} | job=${b.job_id || 'unknown'}`);
 
-    for (const pet of allowed) {
+    // Broadcast ALL pets to WebSocket clients
+    for (const pet of pets) {
         broadcast({
             type:     'brainrot',
             name:     pet.name,
-            gen:      pet.gen || '?',
+            gen:      pet.gen      || '?',
             mutation: pet.mutation || 'None',
-            value:    pet.value || 0,
-            job_id:   b.job_id || '',
-            place_id: b.place_id || '',
+            value:    pet.value    || 0,
+            job_id:   b.job_id    || '',
+            place_id: b.place_id  || '',
         });
     }
 
-    let webhook = null;
-    if      (bestVal >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
-    else if (bestVal >= 400e6) webhook = process.env.WEBHOOK_400_999M;
-    else if (bestVal >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
+    let webhookUrl = null;
+    if      (bestVal >= 999e6) webhookUrl = process.env.WEBHOOK_999M_PLUS;
+    else if (bestVal >= 400e6) webhookUrl = process.env.WEBHOOK_400_999M;
+    else if (bestVal >= 50e6)  webhookUrl = process.env.WEBHOOK_50_400M;
 
-    console.log(`[Batch] ${allowed.length}/${pets.length} pets | best=${best.name} val=${bestVal} | webhook=${webhook ? 'yes' : 'no'}`);
+    console.log(`[Batch] webhook=${webhookUrl ? 'yes' : 'no (below threshold)'}`);
 
-    if (webhook) {
+    if (webhookUrl) {
+        // Image: client first, server wiki fallback
+        let imageUrl = b.image_url || null;
+        if (!imageUrl) {
+            for (const pet of pets) {
+                imageUrl = await fetchWikiImage(pet.name);
+                if (imageUrl) break;
+            }
+        }
+        console.log(`[Batch] image=${imageUrl ? 'found' : 'none'}`);
+
         const bestMut = best.mutation && best.mutation !== 'None' ? best.mutation : 'Base';
-        const color   = bestVal >= 999e6 ? 0xFFD700 : bestVal >= 400e6 ? 0x00BFFF : 0x00AF41;
-
         let desc = `🏆 **Best**\n[${bestMut}] ${best.name} [${displayGen(best.gen)}]`;
-        if (allowed.length > 1) {
+        if (pets.length > 1) {
             desc += '\n\n♦ **Others**';
-            for (const pet of allowed.slice(1)) {
+            for (const pet of pets.slice(1)) {
                 const mut = pet.mutation && pet.mutation !== 'None' ? pet.mutation : 'Base';
                 desc += `\n• [${mut}] ${pet.name} [${displayGen(pet.gen)}]`;
             }
         }
         desc += '\n\n💸 **Buy a Slot!**';
 
-        fireWebhook(webhook, {
+        const pingContent = PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : '';
+
+        await fireWebhook(webhookUrl, {
             title:       '⭐ Cerberus Notifier | Finds',
             description: desc.slice(0, 3900),
-            color,
-            thumbnail:   b.image_url ? { url: b.image_url } : undefined,
+            color:       0x9B59B6,
+            thumbnail:   imageUrl ? { url: imageUrl } : undefined,
             fields:      [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
             footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
             timestamp:   new Date().toISOString(),
-        });
+        }, pingContent);
     }
+
     res.json({ ok: true });
 });
 
 // ── /submit (single pet) ─────────────────────────
-app.post('/submit', (req, res) => {
+app.post('/submit', async (req, res) => {
     if (req.headers['x-api-key'] !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     const b = req.body;
     if (!b?.name) return res.status(400).json({ error: 'Missing name' });
-    const jobId = b.job_id || 'unknown';
 
-    // ✅ Rate limit per pet name so all pets from a scan get through
-    if (isRateLimited(jobId, b.name)) return res.status(429).json({ error: 'Rate limited' });
+    if (isRateLimited()) return res.status(429).json({ error: 'Global rate limit hit' });
 
     broadcast({
-        type: 'brainrot', name: b.name,
-        gen: b.gen || '?', mutation: b.mutation || 'None',
-        value: b.value || 0, job_id: b.job_id || '', place_id: b.place_id || '',
+        type:     'brainrot',
+        name:     b.name,
+        gen:      b.gen      || '?',
+        mutation: b.mutation || 'None',
+        value:    b.value    || 0,
+        job_id:   b.job_id  || '',
+        place_id: b.place_id || '',
     });
 
-    const val = parseFloat(String(b.value || 0));
-    let webhook = null;
-    if      (val >= 999e6) webhook = process.env.WEBHOOK_999M_PLUS;
-    else if (val >= 400e6) webhook = process.env.WEBHOOK_400_999M;
-    else if (val >= 50e6)  webhook = process.env.WEBHOOK_50_400M;
+    const val = parseNum(b.gen);
+    let webhookUrl = null;
+    if      (val >= 999e6) webhookUrl = process.env.WEBHOOK_999M_PLUS;
+    else if (val >= 400e6) webhookUrl = process.env.WEBHOOK_400_999M;
+    else if (val >= 50e6)  webhookUrl = process.env.WEBHOOK_50_400M;
 
-    console.log(`[Submit] ${b.name} | gen=${b.gen} | val=${val} | webhook=${webhook ? 'yes' : 'no'}`);
+    console.log(`[Submit] ${b.name} | val=${val} | webhook=${webhookUrl ? 'yes' : 'no'}`);
 
-    if (webhook) {
+    if (webhookUrl) {
+        let imageUrl = b.image_url || null;
+        if (!imageUrl) imageUrl = await fetchWikiImage(b.name);
+
         const mut = b.mutation && b.mutation !== 'None' ? b.mutation : 'Base';
-        fireWebhook(webhook, {
+        const pingContent = PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : '';
+
+        await fireWebhook(webhookUrl, {
             title:       '⭐ Cerberus Notifier | Find',
             description: `🏆 **Best**\n[${mut}] ${b.name} [${displayGen(b.gen)}]\n\n💸 **Buy a Slot!**`,
-            color:       val >= 999e6 ? 0xFFD700 : val >= 400e6 ? 0x00BFFF : 0x00AF41,
-            thumbnail:   b.image_url ? { url: b.image_url } : undefined,
+            color:       0x9B59B6,
+            thumbnail:   imageUrl ? { url: imageUrl } : undefined,
             fields:      [{ name: 'Players', value: b.players ? `${b.players}/8` : 'Unknown', inline: false }],
             footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
             timestamp:   new Date().toISOString(),
-        });
+        }, pingContent);
     }
+
     res.json({ ok: true });
 });
 
-// ══════════════════════════════════════════════════
+// ──────────────────────────────────────────────────
 //  WEBSOCKET
-// ══════════════════════════════════════════════════
+// ──────────────────────────────────────────────────
 const jobPresence = {};
 
 function presenceJoin(jobId, username) {
@@ -563,8 +584,11 @@ wss.on('connection', async (ws, req) => {
         if (proto) token = proto.split(',')[0].trim() || null;
     }
 
+    console.log('[WS] Auth attempt token=' + (token ? token.slice(0,8)+'…' : 'none'));
+
     const entry = consumeToken(token);
     if (!entry) {
+        console.log('[WS] Auth failed — invalid or expired token');
         try { ws.send(EXPIRED_BUF); } catch {}
         ws.terminate();
         return;
@@ -586,8 +610,7 @@ wss.on('connection', async (ws, req) => {
                 wsKick(ws);
             }, secsLeft * 1000);
         } else {
-            wsKick(ws);
-            return;
+            wsKick(ws); return;
         }
     }
 
@@ -603,8 +626,7 @@ wss.on('connection', async (ws, req) => {
         if (!msg || typeof msg !== 'object') return;
 
         if (msg.type === 'presence_join' && msg.username && msg.job_id) {
-            _username = msg.username;
-            _jobId    = msg.job_id;
+            _username = msg.username; _jobId = msg.job_id;
             if (jobPresence[_jobId]) {
                 for (const existing of jobPresence[_jobId]) {
                     if (existing !== _username) {
@@ -616,7 +638,6 @@ wss.on('connection', async (ws, req) => {
             broadcast({ type: 'presence_join', username: _username, job_id: _jobId }, ws);
             return;
         }
-
         broadcast(msg);
     });
 
@@ -627,6 +648,7 @@ wss.on('connection', async (ws, req) => {
             presenceLeave(_jobId, _username);
             broadcast({ type: 'presence_leave', username: _username, job_id: _jobId }, ws);
         }
+        console.log('[WS] Disconnected:', userKey.slice(0, 8) + '…');
     });
 });
 
@@ -641,14 +663,14 @@ const heartbeatInterval = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeatInterval));
 
-// ─── FALLBACK WATCHER ────────────────────────────
+// ─── WATCHERS ────────────────────────────────────
 setInterval(() => {
     if (wss.clients.size === 0) return;
     const now = Math.floor(Date.now() / 1000);
     for (const ws of wss.clients) {
         if (ws.readyState !== WebSocket.OPEN) continue;
         if (ws._authExpire !== -1 && ws._authExpire && ws._authExpire <= now) {
-            console.log('[Watcher] In-memory expiry kick:', ws._cerberusKey?.slice(0, 8) + '…');
+            console.log('[Watcher] Expiry kick:', ws._cerberusKey?.slice(0, 8) + '…');
             wsKick(ws);
         }
     }
@@ -680,9 +702,9 @@ setInterval(() => {
     }
 }, 20_000);
 
-// ══════════════════════════════════════════════════
+// ──────────────────────────────────────────────────
 //  STARTUP
-// ══════════════════════════════════════════════════
+// ──────────────────────────────────────────────────
 function kickLiveSockets(userKey) {
     for (const client of wss.clients) {
         if (client._cerberusKey === userKey && client.readyState === WebSocket.OPEN) {
@@ -697,12 +719,11 @@ async function rescheduleExpiryTimers() {
     const users = await getAllUsers(true);
     let   count = 0;
     for (const u of users) {
-        if (u.banned) continue;
-        if (u.auth_expire === -1) continue;
+        if (u.banned || u.auth_expire === -1) continue;
         const secsLeft = u.auth_expire - now;
         if (secsLeft <= 0) continue;
         setTimeout(() => {
-            console.log('[Expiry] Startup timer fired:', u.user_key?.slice(0, 8) + '…');
+            console.log('[Expiry] Timer fired:', u.user_key?.slice(0, 8) + '…');
             kickLiveSockets(u.user_key);
             schedulePanel(500);
         }, secsLeft * 1000);
@@ -711,9 +732,9 @@ async function rescheduleExpiryTimers() {
     console.log(`[Startup] Scheduled ${count} expiry timer(s)`);
 }
 
-// ══════════════════════════════════════════════════
+// ──────────────────────────────────────────────────
 //  DISCORD BOT
-// ══════════════════════════════════════════════════
+// ──────────────────────────────────────────────────
 let panelMessageId = null;
 let panelDebounce  = null;
 let sequence       = null;
@@ -767,6 +788,7 @@ function schedulePanel(delayMs = 1000) {
 }
 
 async function updatePanel() {
+    if (!BOT_TOKEN || !CHANNEL_ID) return;
     const now    = Math.floor(Date.now() / 1000);
     const users  = await getAllUsers(true);
     const active = users.filter(u => !u.banned && (u.auth_expire === -1 || u.auth_expire > now));
@@ -782,7 +804,7 @@ async function updatePanel() {
     const embed = {
         title:       `🔴 Cerberus Notifier Active Slots (${used}/${MAX_SLOTS})`,
         description: lines + (full ? '\n\n**All slots are full at the moment.**' : ''),
-        color:       full ? 0xDE3163 : 0x00AF41,
+        color:       0x9B59B6,
         thumbnail:   { url: LOGO_URL },
         footer:      { text: 'Cerberus Notifier • gg/cerberusnotifier' },
         timestamp:   new Date().toISOString(),
@@ -849,7 +871,6 @@ async function handleMessage(msg) {
             });
         }
         setTimeout(() => {
-            console.log('[Expiry] Timer fired for key:', key.slice(0, 8) + '…');
             kickLiveSockets(key);
             schedulePanel(500);
         }, duration.seconds * 1000);
@@ -859,7 +880,7 @@ async function handleMessage(msg) {
                 embeds: [{
                     title:       '🐕 Cerberus Notifier — Your Key',
                     description: `Your slot is active for **${duration.label}**.\n\nHead to the 📡・finder-panel in the Discord server and redeem your key to get started.`,
-                    color:       0x00AF41,
+                    color:       0x9B59B6,
                     thumbnail:   { url: LOGO_URL },
                     fields: [
                         { name: '🔑 Your Key', value: `\`${key}\``,    inline: false },
@@ -913,7 +934,7 @@ async function handleMessage(msg) {
         await discordRequest('POST', `/channels/${msg.channel_id}/messages`, {
             embeds: [{
                 title:  '🐕 Cerberus Bot Commands',
-                color:  0x00AF41,
+                color:  0x9B59B6,
                 fields: [
                     { name: '!addslot @user <duration>', value: 'Add a slot. e.g. `2h` `1d` `1w` `1m`',        inline: false },
                     { name: '!removeslot @user',         value: 'Remove a slot — kicks live session instantly', inline: false },
@@ -925,6 +946,7 @@ async function handleMessage(msg) {
 }
 
 function startGateway() {
+    if (!BOT_TOKEN) return;
     gatewayWs = new WebSocket('wss://gateway.discord.gg/?v=10&encoding=json');
     gatewayWs.on('open', () => console.log('[Gateway] Connected'));
     gatewayWs.on('message', async data => {
@@ -938,11 +960,7 @@ function startGateway() {
             }, d.heartbeat_interval);
             gatewayWs.send(JSON.stringify({
                 op: 2,
-                d: {
-                    token:      BOT_TOKEN,
-                    intents:    33280,
-                    properties: { os: 'linux', browser: 'cerberus', device: 'cerberus' },
-                },
+                d: { token: BOT_TOKEN, intents: 33280, properties: { os: 'linux', browser: 'cerberus', device: 'cerberus' } },
             }));
         }
         if (op === 0 && t === 'READY') {
@@ -950,9 +968,7 @@ function startGateway() {
             await rescheduleExpiryTimers();
             updatePanel();
         }
-        if (op === 0 && t === 'MESSAGE_CREATE') {
-            await handleMessage(d);
-        }
+        if (op === 0 && t === 'MESSAGE_CREATE') await handleMessage(d);
     });
     gatewayWs.on('close', code => {
         console.warn('[Gateway] Closed:', code, '— reconnecting in 5s');
