@@ -86,18 +86,34 @@ async function getAllUsers(forceRefresh = false) {
     } catch { return _usersCache || []; }
 }
 
-function invalidateUsersCache() { _usersCache = null; _usersCacheAt = 0; }
+function invalidateUsersCache() {
+    _usersCache = null;
+    _usersCacheAt = 0;
+    keyValidCache.clear(); // also clear per-key cache
+}
+
+// ─── FIX 1: per-key validation cache so /get_token responds in <5ms ───────────
+const keyValidCache = new Map();
+const KEY_VALID_TTL = 60_000; // 60 seconds
 
 async function isKeyValid(key) {
+    const now = Date.now();
+    const cached = keyValidCache.get(key);
+    if (cached && now - cached.cachedAt < KEY_VALID_TTL) {
+        return { valid: cached.valid, user: cached.user };
+    }
     try {
         const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(key)}`, { headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' } });
         if (!res.ok) return { valid: false, user: null };
         const d = await res.json();
-        if (!d.success || !d.users?.length) return { valid: false, user: null };
-        const u = d.users[0]; const now = Math.floor(Date.now() / 1000);
-        if (u.banned) return { valid: false, user: u };
-        if (u.auth_expire !== -1 && u.auth_expire <= now) return { valid: false, user: u };
-        return { valid: true, user: u };
+        if (!d.success || !d.users?.length) {
+            keyValidCache.set(key, { valid: false, user: null, cachedAt: now });
+            return { valid: false, user: null };
+        }
+        const u = d.users[0]; const nowSec = Math.floor(now / 1000);
+        const valid = !u.banned && (u.auth_expire === -1 || u.auth_expire > nowSec);
+        keyValidCache.set(key, { valid, user: u, cachedAt: now });
+        return { valid, user: u };
     } catch { return { valid: false, user: null }; }
 }
 
@@ -115,7 +131,11 @@ async function createKey(durationSeconds, discordId, label) {
 async function revokeKey(userKey) {
     try {
         const res = await luarmorFetch(`https://api.luarmor.net/v3/projects/${LRM_PID}/users?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE', headers: { Authorization: LRM_KEY, 'Content-Type': 'application/json' } });
-        if (res.ok) invalidateUsersCache(); return res.ok;
+        if (res.ok) {
+            invalidateUsersCache();
+            keyValidCache.delete(userKey); // immediately evict this key
+        }
+        return res.ok;
     } catch { return false; }
 }
 
@@ -125,9 +145,6 @@ async function getKeyByDiscordId(discordId) {
 }
 
 // ─── TOKEN SYSTEM ─────────────────────────────────
-// FIX 1: TTL increased to 5 minutes so slow executors don't burn tokens
-// FIX 2: tokens are NO LONGER consumed on use — they persist until TTL
-//         This fixes the reconnect loop where each attempt needed a new token
 const TOKEN_TTL = 300_000; // 5 minutes
 const tokens    = new Map();
 
@@ -135,7 +152,7 @@ function generateToken(userKey, user) {
     // Reuse existing valid token for this key if one exists
     for (const [tok, entry] of tokens) {
         if (entry.userKey === userKey && Date.now() < entry.expires) {
-            entry.expires = Date.now() + TOKEN_TTL; // refresh TTL on reuse
+            entry.expires = Date.now() + TOKEN_TTL;
             return tok;
         }
     }
@@ -146,13 +163,12 @@ function generateToken(userKey, user) {
     return token;
 }
 
-// FIX: no longer deletes token on use — allows reconnects within TTL window
 function consumeToken(token) {
     if (!token) return null;
     const entry = tokens.get(token);
     if (!entry) return null;
     if (Date.now() > entry.expires) { tokens.delete(token); return null; }
-    return entry; // don't delete — reusable within TTL
+    return entry; // reusable within TTL
 }
 
 const serverSubmitTimes = new Map();
@@ -186,8 +202,18 @@ function wsKick(ws) {
 const PING_STR    = JSON.stringify({ type: 'ping' });
 const EXPIRED_STR = JSON.stringify({ type: 'expired' });
 
+// ─── FIX 2: recent broadcast buffer so late-connecting clients catch up ────────
+const recentBroadcasts = [];
+const MAX_RECENT       = 20;
+const RECENT_TTL       = 120_000; // 2 minutes
+
 function broadcast(obj, excludeWs = null) {
     const str = JSON.stringify(obj);
+    // buffer brainrot events so new connections can replay them
+    if (obj.type === 'brainrot') {
+        recentBroadcasts.push({ str, at: Date.now() });
+        if (recentBroadcasts.length > MAX_RECENT) recentBroadcasts.shift();
+    }
     for (const client of wss.clients) {
         if (client === excludeWs) continue;
         if (client.readyState === WebSocket.OPEN) try { client.send(str); } catch {}
@@ -275,7 +301,6 @@ app.post('/bot_leave', (req, res) => {
     botLeave(user_key); res.json({ ok: true });
 });
 
-// FIX 3: accept key from either query param OR x-api-key header
 app.get('/get_token', async (req, res) => {
     const userKey = (req.query.user_key || req.headers['x-api-key'] || '').trim();
     if (!userKey) return res.status(400).json({ error: 'Missing user_key' });
@@ -371,6 +396,14 @@ wss.on('connection', async (ws, req) => {
 
     console.log(`[WS] Connected: ${userKey.slice(0,8)}...`);
 
+    // ── FIX 2: replay recent brainrot broadcasts to this new connection ──────
+    const now = Date.now();
+    for (const recent of recentBroadcasts) {
+        if (now - recent.at < RECENT_TTL) {
+            try { ws.send(recent.str); } catch {}
+        }
+    }
+
     let expiryTimer = null;
     if (user && user.auth_expire !== -1) {
         const secsLeft = user.auth_expire - Math.floor(Date.now() / 1000);
@@ -388,7 +421,6 @@ wss.on('connection', async (ws, req) => {
     ws.on('message', data => {
         let msg; try { msg = JSON.parse(data); } catch { return; }
         if (!msg || typeof msg !== 'object') return;
-        // FIX 4: respond to client pings with pong so client keepalive works
         if (msg.type === 'ping') { wsSend(ws, { type: 'pong' }); return; }
         if (msg.type === 'presence_join' && msg.username && msg.job_id) {
             _username = msg.username; _jobId = msg.job_id;
@@ -446,6 +478,14 @@ setInterval(() => {
         if (client.readyState === WebSocket.OPEN) try { client.send(PING_STR); } catch {}
     }
 }, 20_000);
+
+// periodically evict stale key cache entries
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of keyValidCache) {
+        if (now - v.cachedAt > KEY_VALID_TTL) keyValidCache.delete(k);
+    }
+}, 120_000);
 
 let panelMessageId = null, panelDebounce = null, sequence = null, heartbeatGW, gatewayWs;
 
