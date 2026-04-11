@@ -486,6 +486,10 @@ app.get('/get_token', async (req, res) => {
     res.json({ token: generateToken(userKey, user) });
 });
 
+// ─── ACTIVE USER REGISTRY ────────────────────────
+// Tracks roblox username+userId per userKey so AJ Users tab can display them
+const activeUserInfo = new Map(); // userKey -> { username, userId, connectedAt }
+
 app.post('/log_execute', async (req, res) => {
     const userKey = (req.headers['x-api-key'] || '').trim();
     if (!userKey) return res.status(401).json({ error: 'Unauthorized' });
@@ -493,6 +497,15 @@ app.post('/log_execute', async (req, res) => {
     if (!valid) return res.status(403).json({ error: 'Invalid or expired key' });
     const { username, userId } = req.body || {};
     if (!username) return res.status(400).json({ error: 'Missing username' });
+
+    // Store for AJ Users tab
+    activeUserInfo.set(userKey, {
+        username: String(username),
+        userId:   String(userId || ''),
+        discordId: user?.discord_id || null,
+        connectedAt: Math.floor(Date.now() / 1000),
+    });
+
     const discordId  = user?.discord_id || null;
     const discordTag = discordId ? `<@${discordId}>` : 'Unknown';
     const webhook = process.env.WEBHOOK_EXECUTIONS;
@@ -508,6 +521,41 @@ app.post('/log_execute', async (req, res) => {
         });
     }
     res.json({ ok: true });
+});
+
+// ─── AJ USERS ENDPOINT ───────────────────────────
+// Returns active slot holders with roblox info + time remaining.
+// Auth: valid user_key in query string (any connected user can poll this).
+app.get('/aj_users', async (req, res) => {
+    const userKey = (req.query.user_key || '').trim();
+    if (!userKey) return res.status(401).json({ error: 'Missing user_key' });
+    const { valid } = await isKeyValid(userKey, 1);
+    if (!valid) return res.status(403).json({ error: 'Unauthorized' });
+
+    const now   = Math.floor(Date.now() / 1000);
+    const users = await getAllUsers(false); // use cache — this gets polled every 30s
+    const active = users.filter(u =>
+        !u.banned &&
+        u.status !== 'banned' &&
+        (u.auth_expire === -1 || u.auth_expire === 0 || u.auth_expire > now)
+    );
+
+    const result = active.map(u => {
+        const info      = activeUserInfo.get(u.user_key);
+        const secsLeft  = (u.auth_expire === -1 || u.auth_expire === 0)
+            ? -1
+            : Math.max(0, u.auth_expire - now);
+        return {
+            user_key:    u.user_key.slice(0, 8) + '…',
+            discord_id:  u.discord_id || null,
+            username:    info?.username || null,
+            userId:      info?.userId   || null,
+            secs_left:   secsLeft,
+            note:        u.note || '',
+        };
+    });
+
+    res.json({ ok: true, users: result });
 });
 
 app.post('/submit_batch', async (req, res) => {
@@ -679,6 +727,8 @@ wss.on('connection', async (ws, req) => {
             presenceLeave(_jobId, _username);
             broadcast({ type:'presence_leave', username:_username, job_id:_jobId }, ws);
         }
+        // Don't remove activeUserInfo on WS close — user may reconnect.
+        // It gets naturally overwritten on next log_execute call.
         console.log('[WS] Closed key=' + userKey.slice(0,8) + '… code=' + code);
     });
 });
